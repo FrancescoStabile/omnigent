@@ -7,7 +7,7 @@
 Build any AI agent — security, code analysis, DevOps, compliance, research — on a production-proven foundation. Extracted from a real-world agent with 17k+ LOC and 320 tests.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-109%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-325%20passing-brightgreen.svg)](#testing)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
@@ -48,13 +48,16 @@ It's the domain-agnostic architecture of a production autonomous agent — the R
 
 | Problem | Omnigent Solution |
 |---------|-------------------|
-| Agents that loop forever | **Circuit breaker** + **loop detection** (hash-based, blocks on first repeat) |
-| Context window overflow | **3-level smart trimming** preserving atomic message groups |
+| Agents that loop forever | **Circuit breaker** + **loop detection** (hash-based, blocks on first repeat) + **rate limiting** (per-iteration and total caps) |
+| Context window overflow | **3-level smart trimming** preserving atomic message groups + **semantic compression** via LLM |
 | "Just a tool caller" | **Reasoning Graph** chains findings into multi-step escalation paths |
-| No methodology | **Hierarchical Planner** with phase-based execution and LLM refinement |
-| Blind tool execution | **Extractors** auto-parse results → **structured memory** → **reflection** |
+| No methodology | **Hierarchical Planner** with phase-based execution, LLM refinement, skip conditions, and **macro-reflection** at phase end |
+| Blind tool execution | **Extractors** auto-parse results → **structured memory** → **async reflection** |
 | Failures crash the agent | **Error recovery patterns** with retry strategies and graceful degradation |
-| Vendor lock-in | **4 LLM providers** with task-based routing 和 automatic fallback |
+| Vendor lock-in | **4 LLM providers** with task-based routing and automatic fallback + **extensible provider ABC** |
+| No human oversight | **Human-in-the-loop** approval steps for sensitive tool calls |
+| Lost progress on crash | **Checkpoint/replay** mid-execution with session resume |
+| Untrusted plugins | **Plugin strict checksum** mode with SHA-256 verification |
 | Starting from zero | **Production-proven** — extracted from a real agent, not built in a weekend |
 
 ## Quick Start
@@ -116,23 +119,28 @@ registry.register(
 **Step 3: Populate registries** (plan templates, chains, extractors, reflectors, error patterns)
 
 ```python
-from omnigent.planner import PLAN_TEMPLATES
-from omnigent.chains import CHAINS, ChainStep
-from omnigent.extractors import EXTRACTORS
+from omnigent.registry import DomainRegistry
+from omnigent.chains import ChainStep
 
-PLAN_TEMPLATES["my_domain"] = [
-    {"name": "Discovery", "objective": "Map the target", "steps": [
-        ("Initial scan", "my_scanner"),
-    ]},
-]
-
-CHAINS["high_risk"] = [
-    ChainStep("Deep dive on flagged items", "deep_scanner"),
-    ChainStep("Generate remediation plan", ""),
-]
-
-EXTRACTORS["my_scanner"] = lambda profile, result, args: setattr(
-    profile, 'risk_score', 0.8
+registry = DomainRegistry(
+    plan_templates={
+        "my_domain": [
+            {"name": "Discovery", "objective": "Map the target", "steps": [
+                ("Initial scan", "my_scanner"),
+            ]},
+        ],
+    },
+    chains={
+        "high_risk": [
+            ChainStep("Deep dive on flagged items", "deep_scanner"),
+            ChainStep("Generate remediation plan", ""),
+        ],
+    },
+    extractors={
+        "my_scanner": lambda profile, result, args: setattr(
+            profile, 'risk_score', 0.8
+        ),
+    },
 )
 ```
 
@@ -146,7 +154,8 @@ from omnigent.router import LLMRouter, Provider
 async def main():
     agent = Agent(
         router=LLMRouter(primary=Provider.DEEPSEEK),
-        tools=registry,
+        tools=tool_registry,
+        registry=registry,  # DomainRegistry with all domain-specific behavior
     )
     async for event in agent.run("Analyze this target"):
         if event.type == "text":
@@ -175,49 +184,66 @@ See [examples/codelens/](examples/codelens/) for a complete working implementati
 
 | Module | Purpose | How to Customize |
 |--------|---------|-----------------|
-| [agent.py](src/omnigent/agent.py) | ReAct loop, circuit breaker, loop detection | Subclass `Agent`, override hooks |
-| [router.py](src/omnigent/router.py) | Multi-provider LLM routing (DeepSeek, Claude, OpenAI, Ollama) | Works as-is |
+| [agent.py](src/omnigent/agent.py) | ReAct loop, circuit breaker, loop detection, rate limiting, approval | Subclass `Agent`, override step methods and hooks |
+| [registry.py](src/omnigent/registry.py) | Centralised `DomainRegistry` dataclass for all domain-specific registries | Pass `DomainRegistry(...)` to `Agent` |
+| [router.py](src/omnigent/router.py) | Multi-provider LLM routing with `LLMProvider` ABC and extended thinking | Subclass `LLMProvider` for new providers |
 | [reasoning_graph.py](src/omnigent/reasoning_graph.py) | Directed graph for multi-step reasoning chains | Subclass `ReasoningGraph` |
-| [planner.py](src/omnigent/planner.py) | Hierarchical task planning with phases and steps | Populate `PLAN_TEMPLATES` |
-| [context.py](src/omnigent/context.py) | Smart context trimming with atomic grouping | Works as-is |
-| [domain_profile.py](src/omnigent/domain_profile.py) | Structured memory with hypothesis tracking | Subclass `DomainProfile` |
+| [planner.py](src/omnigent/planner.py) | Hierarchical task planning with skip conditions and macro-reflection | Populate `plan_templates` in `DomainRegistry` |
+| [context.py](src/omnigent/context.py) | Smart context trimming + LLM-based semantic compression | Works as-is |
+| [domain_profile.py](src/omnigent/domain_profile.py) | Structured memory with bounded hypothesis tracking | Subclass `DomainProfile` |
 | [state.py](src/omnigent/state.py) | Agent state with Pydantic-validated findings | Set `enrich_fn` hook |
-| [extractors.py](src/omnigent/extractors.py) | Auto-parse tool results into DomainProfile | Populate `EXTRACTORS` |
-| [reflection.py](src/omnigent/reflection.py) | Strategic insight after each tool call | Populate `REFLECTORS` |
-| [error_recovery.py](src/omnigent/error_recovery.py) | Pattern-matched recovery guidance | Populate `ERROR_PATTERNS` |
-| [chains.py](src/omnigent/chains.py) | Escalation chains for confirmed findings | Populate `CHAINS` |
-| [knowledge_loader.py](src/omnigent/knowledge_loader.py) | Section-level knowledge retrieval with budgets | Populate `KNOWLEDGE_MAP` |
-| [few_shot_examples.py](src/omnigent/few_shot_examples.py) | Tool usage examples for improved accuracy | Populate `EXAMPLES` |
-| [plugins.py](src/omnigent/plugins.py) | Filesystem plugin discovery and loading | Drop into `~/.omnigent/plugins/` |
-| [session.py](src/omnigent/session.py) | Session persistence, resume, export | Works as-is |
+| [extractors.py](src/omnigent/extractors.py) | Auto-parse tool results into DomainProfile | Populate `extractors` in `DomainRegistry` |
+| [reflection.py](src/omnigent/reflection.py) | Async strategic insight after each tool call | Populate `reflectors` in `DomainRegistry` |
+| [error_recovery.py](src/omnigent/error_recovery.py) | Pattern-matched recovery guidance | Populate `error_patterns` in `DomainRegistry` |
+| [chains.py](src/omnigent/chains.py) | Escalation chains for confirmed findings | Populate `chains` in `DomainRegistry` |
+| [knowledge_loader.py](src/omnigent/knowledge_loader.py) | Section-level knowledge retrieval with budgets | Populate `knowledge_map` in `DomainRegistry` |
+| [few_shot_examples.py](src/omnigent/few_shot_examples.py) | Tool usage examples for improved accuracy | Populate `examples` in `DomainRegistry` |
+| [plugins.py](src/omnigent/plugins.py) | Filesystem plugin discovery with strict checksum mode | Drop into `~/.omnigent/plugins/` |
+| [session.py](src/omnigent/session.py) | Session persistence, resume, export, checkpoint/replay | Works as-is |
 | [cost_tracker.py](src/omnigent/cost_tracker.py) | Per-provider, per-task cost tracking | Works as-is |
 | [config.py](src/omnigent/config.py) | YAML + .env + ENV config loading | Works as-is |
-| [tools/](src/omnigent/tools/__init__.py) | Tool registry with scope checking | Register domain tools |
+| [tools/](src/omnigent/tools/__init__.py) | Tool registry with scope checking and schema caching | Register domain tools |
 
 ## Key Design Patterns
 
 ### Data-Driven Registries (Zero Domain Code in Core)
-All domain-specific behavior lives in **dictionaries that start empty**. Your agent populates them at startup:
+All domain-specific behavior lives in a single injectable `DomainRegistry` dataclass. Your agent populates it at startup:
 
 ```python
-PLAN_TEMPLATES  # Task plan templates
-CHAINS          # Escalation chains
-EXTRACTORS      # Tool result parsers
-REFLECTORS      # Post-tool strategic analysis
-ERROR_PATTERNS  # Failure recovery patterns
-KNOWLEDGE_MAP   # Knowledge file routing
-EXAMPLES        # Few-shot tool examples
-TOOL_TIMEOUTS   # Per-tool timeouts
+from omnigent.registry import DomainRegistry
+
+registry = DomainRegistry(
+    plan_templates={...},   # Task plan templates
+    chains={...},           # Escalation chains
+    extractors={...},       # Tool result parsers
+    reflectors={...},       # Post-tool strategic analysis
+    error_patterns={...},   # Failure recovery patterns
+    knowledge_map={...},    # Knowledge file routing
+    examples={...},         # Few-shot tool examples
+    tool_timeouts={...},    # Per-tool timeouts
+)
+
+agent = Agent(registry=registry)
 ```
+
+Multiple agents can run with independent registries — no global state leaks. For backward compatibility, `DomainRegistry.default()` reads the module-level dicts.
 
 ### Subclass for Complex Domains
 For behavior that can't be expressed as data, override methods:
 
 ```python
 class MyAgent(Agent):
+    # Domain hooks
     def _is_failure(self, tool_name, result): ...
     def _extract_finding(self, text): ...
     def _build_dynamic_system_prompt(self): ...
+
+    # Overridable step methods (decomposed agent loop)
+    def _do_context_management(self): ...
+    async def _do_llm_call(self, system_prompt): ...
+    async def _do_tool_execution(self, tool_calls): ...
+    async def _do_post_tool_processing(self, tc, result): ...
+    def _check_termination(self, text_buffer): ...
 
 class MyGraph(ReasoningGraph):
     def _build_default_graph(self): ...
@@ -252,35 +278,36 @@ pytest tests/test_reasoning_graph.py -v
 pytest -m unit
 ```
 
-109 tests covering all core components. Every test runs without LLM calls or network access.
+325 tests covering all core components. Every test runs without LLM calls or network access.
 
 ## Project Structure
 
 ```
 omnigent/
 ├── src/omnigent/         # Core framework
-│   ├── agent.py           # The ReAct loop (688 lines)
-│   ├── router.py          # Multi-provider LLM routing (571 lines)
-│   ├── reasoning_graph.py # Chain reasoning engine (377 lines)
-│   ├── planner.py         # Hierarchical task planner (402 lines)
-│   ├── context.py         # Smart context management (229 lines)
+│   ├── agent.py           # The ReAct loop (1024 lines)
+│   ├── registry.py        # DomainRegistry dataclass (97 lines)
+│   ├── router.py          # Multi-provider LLM routing + LLMProvider ABC (700 lines)
+│   ├── reasoning_graph.py # Chain reasoning engine (389 lines)
+│   ├── planner.py         # Hierarchical task planner + macro-reflection (544 lines)
+│   ├── context.py         # Smart context + semantic compression (358 lines)
 │   ├── state.py           # State + Pydantic findings
-│   ├── domain_profile.py  # Structured agent memory
+│   ├── domain_profile.py  # Structured agent memory (bounded summaries)
 │   ├── extractors.py      # Result parsing pipeline
-│   ├── reflection.py      # Post-tool strategic analysis
+│   ├── reflection.py      # Async post-tool strategic analysis
 │   ├── error_recovery.py  # Failure recovery engine
 │   ├── chains.py          # Escalation chain registry
 │   ├── knowledge_loader.py # Knowledge base retrieval
 │   ├── few_shot_examples.py # Tool usage examples
-│   ├── plugins.py         # Plugin system (487 lines)
-│   ├── session.py         # Session persistence
+│   ├── plugins.py         # Plugin system + strict checksum mode (556 lines)
+│   ├── session.py         # Session persistence + checkpoint/replay (546 lines)
 │   ├── cost_tracker.py    # Cost tracking
 │   ├── config.py          # Configuration management
 │   ├── logging_config.py  # Structured JSON logging
 │   ├── prompts/system.md  # Base system prompt
-│   └── tools/             # Tool registry
+│   └── tools/             # Tool registry + schema caching (309 lines)
 ├── examples/codelens/     # Complete working example agent
-├── tests/                 # 109 tests
+├── tests/                 # 325 tests
 ├── ARCHITECTURE.md        # Deep technical architecture doc
 ├── CONTRIBUTING.md        # Contribution guide
 └── CHANGELOG.md           # Version history

@@ -45,6 +45,7 @@ class ToolRegistry:
         self.tools: dict[str, dict] = {}
         self.allowed_targets = allowed_targets or []
         self._logger = logging.getLogger("omnigent.tools")
+        self._cached_schemas: list[dict] | None = None
 
     def register(self, name: str, func: callable = None, schema: dict = None, *, handler: callable = None):
         """Register a tool.
@@ -56,6 +57,7 @@ class ToolRegistry:
         if fn is None:
             raise ValueError("Must provide func or handler")
         self.tools[name] = {"func": fn, "schema": schema or {}}
+        self._cached_schemas = None  # Invalidate cache
 
     async def close(self):
         """Cleanup async resources. Override in domain implementation."""
@@ -80,8 +82,8 @@ class ToolRegistry:
 
         Uses proper hostname extraction and CIDR matching.
         """
-        from urllib.parse import urlparse
         import ipaddress
+        from urllib.parse import urlparse
 
         def _extract_host(value: str) -> str:
             v = value.strip()
@@ -162,7 +164,13 @@ class ToolRegistry:
             return json.dumps({"error": str(e)})
 
     def get_schemas(self) -> list[dict]:
-        """Get all tool schemas for LLM with few-shot examples."""
+        """Get all tool schemas for LLM with few-shot examples.
+
+        Results are cached and invalidated on register()/unregister().
+        """
+        if self._cached_schemas is not None:
+            return self._cached_schemas
+
         schemas = []
         for name, tool in self.tools.items():
             schema = {
@@ -188,7 +196,16 @@ class ToolRegistry:
 
             schemas.append(schema)
 
+        self._cached_schemas = schemas
         return schemas
+
+    def unregister(self, name: str) -> bool:
+        """Unregister a tool by name. Returns True if it existed."""
+        if name in self.tools:
+            del self.tools[name]
+            self._cached_schemas = None  # Invalidate cache
+            return True
+        return False
 
     def list_tools(self) -> list[str]:
         """List all registered tool names."""
@@ -204,7 +221,7 @@ CREATE_FINDING_SCHEMA = {
         "Register a finding/issue discovered during analysis. "
         "Use this to formally report discovered issues with severity and evidence."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "Short title of the finding"},
@@ -217,5 +234,76 @@ CREATE_FINDING_SCHEMA = {
             "evidence": {"type": "string", "description": "Proof/evidence of the finding"},
         },
         "required": ["title", "severity", "description"],
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Built-in: submit_analysis tool (structured output via tool use)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SUBMIT_ANALYSIS_SCHEMA = {
+    "description": (
+        "Submit a structured analysis of a completed step or phase. "
+        "Use this to provide a formal, machine-readable summary of what was discovered, "
+        "what conclusions were reached, and what should be done next. "
+        "This replaces free-text summaries with structured, validated output."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "step_summary": {
+                "type": "string",
+                "description": "Brief summary of what was done in this step (1-2 sentences).",
+            },
+            "findings": {
+                "type": "array",
+                "description": "List of findings from this analysis step.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Finding title"},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["critical", "high", "medium", "low", "info"],
+                        },
+                        "description": {"type": "string"},
+                        "evidence": {"type": "string"},
+                        "location": {"type": "string", "description": "Where in the subject this was found"},
+                    },
+                    "required": ["title", "severity", "description"],
+                },
+            },
+            "hypotheses": {
+                "type": "array",
+                "description": "New hypotheses to investigate.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "hypothesis_type": {"type": "string", "description": "Category of the hypothesis"},
+                        "location": {"type": "string", "description": "Where to investigate"},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Confidence level (0.0 = wild guess, 1.0 = very confident)",
+                        },
+                        "evidence": {"type": "string", "description": "Supporting evidence"},
+                    },
+                    "required": ["hypothesis_type", "location"],
+                },
+            },
+            "next_action": {
+                "type": "string",
+                "description": "Recommended next action or tool to use.",
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "description": "Overall confidence in the analysis (0.0-1.0).",
+            },
+        },
+        "required": ["step_summary", "findings"],
     },
 }

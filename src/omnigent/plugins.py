@@ -26,14 +26,16 @@ Plugin structure example:
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger("omnigent.plugins")
 
@@ -99,16 +101,75 @@ class PluginManager:
                 tool_registry.register(name, func, plugin.tool_schemas.get(name, {}))
     """
 
-    def __init__(self, plugin_dir: Path | str | None = None):
+    def __init__(self, plugin_dir: Path | str | None = None, strict_checksums: bool = False):
         self.plugin_dir = Path(plugin_dir) if plugin_dir else PLUGIN_DIR
+        self.strict_checksums = strict_checksums
         self.discovered: list[PluginMeta] = []
         self.loaded: list[LoadedPlugin] = []
         self._errors: list[tuple[str, str]] = []
+
+    # Required fields in plugin.json for validation
+    REQUIRED_MANIFEST_FIELDS = {"name", "version", "type"}
+    VALID_PLUGIN_TYPES = {"tool", "extractor", "knowledge", "all"}
 
     def ensure_plugin_dir(self) -> Path:
         """Create plugin directory if it doesn't exist."""
         self.plugin_dir.mkdir(parents=True, exist_ok=True)
         return self.plugin_dir
+
+    def _validate_manifest(self, data: dict, plugin_dir: Path) -> bool:
+        """Validate plugin manifest has required fields and valid values."""
+        missing = self.REQUIRED_MANIFEST_FIELDS - set(data.keys())
+        if missing:
+            logger.warning(f"Plugin {plugin_dir.name}: manifest missing required fields: {missing}")
+            return False
+        ptype = data.get("type", "")
+        if ptype not in self.VALID_PLUGIN_TYPES:
+            logger.warning(f"Plugin {plugin_dir.name}: invalid type '{ptype}', expected one of {self.VALID_PLUGIN_TYPES}")
+            return False
+        return True
+
+    def _verify_checksums(self, plugin_dir: Path) -> bool:
+        """Verify plugin file SHA-256 checksums if checksums.json exists.
+
+        In strict mode (strict_checksums=True), plugins without checksums.json
+        are REJECTED. In normal mode, they are loaded with a warning (backward compatible).
+        """
+        checksums_file = plugin_dir / "checksums.json"
+        if not checksums_file.exists():
+            if self.strict_checksums:
+                logger.warning(
+                    f"Plugin {plugin_dir.name}: no checksums.json found "
+                    f"(strict mode enabled — plugin rejected)"
+                )
+                return False
+            return True  # No checksums = trust (backward compatible)
+
+        try:
+            checksums = json.loads(checksums_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Invalid checksums.json in {plugin_dir.name}: {e}")
+            return False
+
+        if not isinstance(checksums, dict):
+            logger.warning(f"Plugin {plugin_dir.name}: checksums.json must be a dict")
+            return False
+
+        for filename, expected_hash in checksums.items():
+            file_path = plugin_dir / filename
+            if not file_path.exists():
+                logger.warning(f"Plugin {plugin_dir.name}: missing file referenced in checksums: {filename}")
+                return False
+            actual_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+            if actual_hash != expected_hash:
+                logger.error(
+                    f"Plugin {plugin_dir.name}: SHA-256 hash mismatch for {filename} "
+                    f"(expected {expected_hash[:16]}..., got {actual_hash[:16]}...)"
+                )
+                return False
+
+        logger.debug(f"Plugin {plugin_dir.name}: checksum verification passed ({len(checksums)} files)")
+        return True
 
     def discover(self) -> list[PluginMeta]:
         """Discover plugins in the plugin directory."""
@@ -144,6 +205,9 @@ class PluginManager:
         if json_file.exists():
             try:
                 data = json.loads(json_file.read_text())
+                if not self._validate_manifest(data, plugin_dir):
+                    logger.warning(f"Plugin {plugin_dir.name}: manifest validation failed, skipping")
+                    return None
                 return PluginMeta(
                     name=data.get("name", plugin_dir.name),
                     version=data.get("version", "0.1.0"),
@@ -213,6 +277,12 @@ class PluginManager:
 
     def _load_plugin(self, meta: PluginMeta) -> LoadedPlugin | None:
         """Load a single plugin."""
+        # Verify checksums before loading any code
+        if not self._verify_checksums(meta.path):
+            logger.error(f"Checksum verification failed for plugin {meta.name}, skipping")
+            self._errors.append((meta.name, "Checksum verification failed"))
+            return None
+
         plugin = LoadedPlugin(meta=meta)
 
         plugin_path = str(meta.path)

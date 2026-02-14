@@ -24,11 +24,11 @@ Example (security domain):
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from omnigent.context import estimate_tokens as _estimate_tokens
 from omnigent.domain_profile import DomainProfile
 
 # Override in domain implementation to point to your knowledge files
@@ -45,14 +45,14 @@ class _Chunk:
     """An individual section extracted from a knowledge markdown file."""
     heading: str   # Text after "## " (empty for intro before first heading)
     content: str   # Full section text including the heading line
-    tokens: int    # Estimated token count (len // 4)
+    tokens: int    # Estimated token count via context.estimate_tokens()
 
 
 def _flush(out: list[_Chunk], heading: str, buf: list[str]) -> None:
     """Flush accumulated lines into a Chunk if the section is non-trivial."""
     content = "\n".join(buf).strip()
     if content and len(content) > 80:
-        out.append(_Chunk(heading=heading, content=content, tokens=len(content) // 4))
+        out.append(_Chunk(heading=heading, content=content, tokens=_estimate_tokens(content)))
 
 
 def _split_sections(text: str) -> list[_Chunk]:
@@ -169,12 +169,12 @@ def load_knowledge(keys: list[str], max_total_tokens: int = 3000) -> str:
                 seen_sections.add(dedup_key)
 
                 if budget_used + chunk.tokens > max_total_tokens:
-                    remaining_chars = (max_total_tokens - budget_used) * 4
+                    remaining_chars = (max_total_tokens - budget_used) * 3
                     if remaining_chars > 500:
                         text = chunk.content[:remaining_chars] + "\n\n[... truncated for context budget ...]"
                         label = f"### {rel_path}" + (f" — {chunk.heading}" if chunk.heading else "")
                         collected.append(f"{label}\n{text}")
-                        budget_used += remaining_chars // 4
+                        budget_used += _estimate_tokens(text)
                     break
 
                 label = f"### {rel_path}" + (f" — {chunk.heading}" if chunk.heading else "")

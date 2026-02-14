@@ -281,7 +281,11 @@ class ReasoningGraph:
         return available
 
     def get_next_steps(self, limit: int = 5) -> list[ReasoningEdge]:
-        """Return highest-priority next steps (confirmed source → unknown target)."""
+        """Return highest-priority next steps (confirmed source → unknown target).
+
+        Respects requires_all: an edge is only available if ALL nodes in its
+        requires_all list are confirmed/exploited.
+        """
         next_edges: list[ReasoningEdge] = []
         for edge in self.edges:
             source_node = self.nodes.get(edge.source)
@@ -292,6 +296,15 @@ class ReasoningGraph:
                 continue
             if target_node.state not in (NodeState.UNKNOWN, NodeState.SUSPECTED):
                 continue
+            # Validate requires_all prerequisites
+            if edge.requires_all:
+                all_met = all(
+                    self.nodes.get(req) is not None
+                    and self.nodes[req].state in (NodeState.CONFIRMED, NodeState.EXPLOITED)
+                    for req in edge.requires_all
+                )
+                if not all_met:
+                    continue
             next_edges.append(edge)
         next_edges.sort(key=lambda e: e.priority)
         return next_edges[:limit]

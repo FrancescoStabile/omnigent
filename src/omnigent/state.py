@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import enum
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -149,13 +150,23 @@ class State:
     started_at: datetime = field(default_factory=datetime.now)
     iteration: int = 0
 
+    # Incremental token tracking
+    _total_tokens: int = 0
+
     # Enrichment hook — set this to your domain's enrichment function
     enrich_fn: EnrichFn | None = None
 
     def add_message(self, role: str, content: str | list):
-        """Add message to history."""
+        """Add message to history with incremental token tracking."""
+        from omnigent.context import estimate_tokens
         self.messages.append({"role": role, "content": content})
+        self._total_tokens += estimate_tokens(content)
         self.iteration += 1
+
+    @property
+    def total_tokens(self) -> int:
+        """Get accumulated token count (O(1) instead of recalculating)."""
+        return self._total_tokens
 
     def add_finding(self, finding: Finding):
         """Add finding with optional auto-enrichment via hook."""
@@ -185,4 +196,5 @@ class State:
         self.profile = DomainProfile()
         self.plan = TaskPlan(objective="")
         self.iteration = 0
+        self._total_tokens = 0
         self.started_at = datetime.now()

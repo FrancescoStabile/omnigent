@@ -113,6 +113,104 @@ class TestTaskPlan:
         assert restored.phases[0].steps[0].status == PhaseStatus.COMPLETE
 
 
+class TestFailureTracking:
+    """Tests for dynamic replanning: record_failure, reset_failure_count, needs_replan."""
+
+    def _make_plan(self):
+        return TaskPlan(
+            objective="Test",
+            phases=[
+                TaskPhase(
+                    name="Phase 1",
+                    objective="First",
+                    steps=[
+                        TaskStep(description="Step 1A", tool_hint="tool_a"),
+                    ],
+                ),
+            ],
+        )
+
+    def test_consecutive_failures_initialized_zero(self):
+        phase = TaskPhase(name="Test", objective="Obj")
+        assert phase.consecutive_failures == 0
+
+    def test_record_failure_increments(self):
+        plan = self._make_plan()
+        plan.current_phase()
+        plan.record_failure("tool_a")
+        assert plan.phases[0].consecutive_failures == 1
+        plan.record_failure("tool_a")
+        assert plan.phases[0].consecutive_failures == 2
+
+    def test_reset_failure_count(self):
+        plan = self._make_plan()
+        plan.current_phase()
+        plan.record_failure("tool_a")
+        plan.record_failure("tool_a")
+        plan.reset_failure_count()
+        assert plan.phases[0].consecutive_failures == 0
+
+    def test_needs_replan_below_threshold(self):
+        plan = self._make_plan()
+        plan.current_phase()
+        plan.record_failure("tool_a")
+        plan.record_failure("tool_a")
+        assert not plan.needs_replan(threshold=3)
+
+    def test_needs_replan_at_threshold(self):
+        plan = self._make_plan()
+        plan.current_phase()
+        for _ in range(3):
+            plan.record_failure("tool_a")
+        assert plan.needs_replan(threshold=3)
+
+    def test_needs_replan_custom_threshold(self):
+        plan = self._make_plan()
+        plan.current_phase()
+        plan.record_failure("tool_a")
+        plan.record_failure("tool_a")
+        assert plan.needs_replan(threshold=2)
+        assert not plan.needs_replan(threshold=3)
+
+    def test_needs_replan_no_active_phase(self):
+        plan = TaskPlan(objective="Empty")
+        assert not plan.needs_replan()
+
+    def test_failure_count_serialized_in_to_dict(self):
+        plan = self._make_plan()
+        plan.current_phase()
+        plan.record_failure("tool_a")
+        plan.record_failure("tool_a")
+        d = plan.to_dict()
+        assert d["phases"][0]["consecutive_failures"] == 2
+
+    def test_failure_count_restored_from_dict(self):
+        plan = self._make_plan()
+        plan.current_phase()
+        plan.record_failure("tool_a")
+        plan.record_failure("tool_a")
+        d = plan.to_dict()
+        restored = TaskPlan.from_dict(d)
+        assert restored.phases[0].consecutive_failures == 2
+
+    def test_failure_count_defaults_zero_in_from_dict(self):
+        """Old serialized plans without consecutive_failures should default to 0."""
+        data = {
+            "objective": "Test",
+            "phases": [
+                {
+                    "name": "Phase 1",
+                    "objective": "First",
+                    "steps": [],
+                    "status": "active",
+                    # No consecutive_failures key
+                }
+            ],
+        }
+        plan = TaskPlan.from_dict(data)
+        assert plan.phases[0].consecutive_failures == 0
+
+
 class TestPlanner:
     def test_generate_plan_fallback(self):
         """When no template matches, generates a minimal fallback plan."""

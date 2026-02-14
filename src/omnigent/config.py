@@ -2,20 +2,24 @@
 Omnigent — Config Management
 
 Unified configuration loading from multiple sources:
-1. ~/.omnigent/config.yaml (persistent, recommended)
-2. .env file (project-local)
-3. Environment variables (override)
+1. OS keyring (secure, via `keyring` library if installed)
+2. ~/.omnigent/config.yaml (persistent, recommended)
+3. .env file (project-local)
+4. Environment variables (override)
 
-Priority: ENV > .env > config.yaml
+Priority: ENV > keyring > .env > config.yaml
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger("omnigent.config")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Config Paths
@@ -70,11 +74,48 @@ class Config:
                 return
             check = check.parent
 
+    def _try_keyring_get(self, key: str) -> str | None:
+        """Try to get a value from OS keyring (macOS Keychain, Windows DPAPI, Linux Secret Service)."""
+        try:
+            import keyring
+            value = keyring.get_password("omnigent", key)
+            return value
+        except ImportError:
+            return None
+        except Exception as e:
+            logger.debug(f"Keyring get failed for {key}: {e}")
+            return None
+
+    def _try_keyring_set(self, key: str, value: str) -> bool:
+        """Try to store a value in OS keyring."""
+        try:
+            import keyring
+            keyring.set_password("omnigent", key, value)
+            return True
+        except ImportError:
+            return False
+        except Exception as e:
+            logger.debug(f"Keyring set failed for {key}: {e}")
+            return False
+
+    def _try_keyring_delete(self, key: str) -> bool:
+        """Try to delete a value from OS keyring."""
+        try:
+            import keyring
+            keyring.delete_password("omnigent", key)
+            return True
+        except (ImportError, Exception):
+            return False
+
     def _apply_env_overrides(self):
-        """Environment variables override config file."""
+        """Apply overrides: ENV > keyring > file config."""
         for key in self.API_KEY_NAMES:
             if key in os.environ:
                 self.data[key] = os.environ[key]
+            elif key not in self.data or not self.data[key]:
+                keyring_value = self._try_keyring_get(key)
+                if keyring_value:
+                    self.data[key] = keyring_value
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get config value."""
@@ -85,15 +126,21 @@ class Config:
         self.data[key] = value
 
     def save(self):
-        """Save config to ~/.omnigent/config.yaml."""
+        """Save config. API keys go to OS keyring if available, rest to YAML."""
         try:
             OMNIGENT_HOME.mkdir(parents=True, exist_ok=True)
+            yaml_data = {}
+            for k, v in self.data.items():
+                if k in self.API_KEY_NAMES and v and self._try_keyring_set(k, v):
+                    logger.debug(f"Stored {k} in OS keyring")
+                    continue  # Stored in keyring, don't put in YAML
+                yaml_data[k] = v
             with open(CONFIG_FILE, "w") as f:
-                yaml.dump(self.data, f, default_flow_style=False)
+                yaml.dump(yaml_data, f, default_flow_style=False)
         except (OSError, PermissionError) as e:
             import sys
             print(f"[!] Warning: Could not save config to {CONFIG_FILE}: {e}", file=sys.stderr)
-            print(f"[i] Config will work for this session only.", file=sys.stderr)
+            print("[i] Config will work for this session only.", file=sys.stderr)
 
     def has_api_key(self) -> bool:
         """Check if at least one API key is configured."""
@@ -166,7 +213,7 @@ def interactive_setup() -> Config:
         console.print(f"\n[bold #00ff41]✓ Config saved:[/] {CONFIG_FILE}")
         console.print("Edit anytime: [cyan]~/.omnigent/config.yaml[/]\n")
     else:
-        console.print(f"\n[bold yellow]✓ Config loaded (session-only)[/]")
+        console.print("\n[bold yellow]✓ Config loaded (session-only)[/]")
         console.print("Use environment variables for persistent config.\n")
 
     return config

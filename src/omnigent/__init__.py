@@ -19,6 +19,6 @@ __version__ = "0.1.0"
 __author__ = "Francesco Stabile"
 __description__ = "Universal autonomous agent framework with ReAct loop, reasoning graph, and MCP integration."
 
-from omnigent.config import load_config, ensure_config, Config
+from omnigent.config import Config, ensure_config, load_config
 
 __all__ = ["load_config", "ensure_config", "Config"]

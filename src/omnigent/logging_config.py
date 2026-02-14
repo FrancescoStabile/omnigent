@@ -5,11 +5,11 @@ JSON logging to file with rotation.
 Helps debug production issues without cluttering user output.
 """
 
+import json
 import logging
 import logging.handlers
-import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 class JSONFormatter(logging.Formatter):

@@ -36,6 +36,7 @@ class Hypothesis:
     confirmed: bool = False
     tool_used: str = ""
     notes: str = ""
+    step_ref: str = ""         # Link to TaskStep (phase:step_index)
 
     def __str__(self) -> str:
         status = "CONFIRMED" if self.confirmed else ("TESTED" if self.tested else "UNTESTED")
@@ -108,10 +109,16 @@ class DomainProfile:
 
     # ── Context injection ──
 
-    def to_prompt_summary(self) -> str:
+    def to_prompt_summary(
+        self, max_confirmed: int = 15, max_untested: int = 10
+    ) -> str:
         """
         Generate a structured summary for LLM context injection.
         Override this in your domain profile for richer output.
+
+        Args:
+            max_confirmed: Maximum confirmed findings to include (default 15).
+            max_untested: Maximum untested hypotheses to include (default 10).
         """
         if not self.subject:
             return ""
@@ -122,18 +129,24 @@ class DomainProfile:
         untested = self.get_untested_hypotheses()
 
         if confirmed:
+            shown = confirmed[:max_confirmed]
             lines.append(f"\n### Confirmed Findings ({len(confirmed)})")
-            for v in confirmed:
+            for v in shown:
                 lines.append(f"- {v}")
+            if len(confirmed) > max_confirmed:
+                lines.append(f"- ... and {len(confirmed) - max_confirmed} more")
 
         if untested:
+            shown = untested[:max_untested]
             lines.append(f"\n### Untested Hypotheses ({len(untested)})")
-            for h in untested[:10]:
+            for h in shown:
                 lines.append(f"- {h}")
+            if len(untested) > max_untested:
+                lines.append(f"- ... and {len(untested) - max_untested} more")
 
         if self.metadata:
-            lines.append(f"\n### Metadata")
-            for k, v in self.metadata.items():
+            lines.append("\n### Metadata")
+            for k, v in list(self.metadata.items())[:20]:
                 lines.append(f"- {k}: {v}")
 
         return "\n".join(lines)
@@ -145,7 +158,7 @@ class DomainProfile:
         return dataclasses.asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "DomainProfile":
+    def from_dict(cls, data: dict) -> DomainProfile:
         """Deserialize from session data."""
         if not data:
             return cls()

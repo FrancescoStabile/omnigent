@@ -86,4 +86,4 @@ class TestToolRegistry:
 
     def test_create_finding_schema_exists(self):
         assert "description" in CREATE_FINDING_SCHEMA
-        assert "input_schema" in CREATE_FINDING_SCHEMA
+        assert "parameters" in CREATE_FINDING_SCHEMA

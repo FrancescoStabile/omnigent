@@ -31,20 +31,22 @@ import json
 import logging
 import re
 from collections import deque
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import AsyncGenerator, Any, Union
+from typing import Any
 
-from omnigent.router import LLMRouter, Provider, TaskType
-from omnigent.state import State, Finding
-from omnigent.tools import ToolRegistry
-from omnigent.error_recovery import inject_recovery_guidance
-from omnigent.context import smart_trim_context, should_trim_context, estimate_tokens
-from omnigent.extractors import run_extractor
-from omnigent.planner import generate_plan, generate_plan_with_llm
-from omnigent.reflection import reflect_on_result
 from omnigent.chains import format_chain_for_prompt
+from omnigent.context import estimate_tokens, should_trim_context, smart_trim_context
+from omnigent.error_recovery import inject_recovery_guidance
+from omnigent.extractors import run_extractor
 from omnigent.knowledge_loader import get_relevant_knowledge
+from omnigent.planner import generate_phase_reflection, generate_plan, generate_plan_with_llm
 from omnigent.reasoning_graph import ReasoningGraph
+from omnigent.reflection import reflect_on_result, reflect_on_result_async
+from omnigent.registry import DomainRegistry
+from omnigent.router import LLMRouter, Provider, TaskType
+from omnigent.state import Finding, State
+from omnigent.tools import CREATE_FINDING_SCHEMA, SUBMIT_ANALYSIS_SCHEMA, ToolRegistry
 
 logger = logging.getLogger("omnigent.agent")
 
@@ -81,6 +83,9 @@ class AgentEvent:
       error         — Error occurred (message=str)
       paused        — Agent paused by user
       done          — Agent loop finished
+
+    For type-safe event handling, use isinstance() with the typed subclasses
+    (TextEvent, ToolStartEvent, etc.) or match on event.type string.
     """
 
     def __init__(self, type: str, **data):
@@ -102,6 +107,65 @@ class AgentEvent:
     @property
     def finding(self) -> Finding | None:
         return self.data.get("finding")
+
+    def __repr__(self) -> str:
+        return f"AgentEvent({self.type!r}, {self.data})"
+
+
+class TextEvent(AgentEvent):
+    """LLM text token."""
+    def __init__(self, content: str):
+        super().__init__("text", content=content)
+
+
+class ToolStartEvent(AgentEvent):
+    """Tool execution starting."""
+    def __init__(self, tool_name: str, arguments: dict):
+        super().__init__("tool_start", tool_name=tool_name, arguments=arguments)
+
+
+class ToolEndEvent(AgentEvent):
+    """Tool execution finished."""
+    def __init__(self, tool_name: str, tool_result: str):
+        super().__init__("tool_end", tool_name=tool_name, tool_result=tool_result)
+
+
+class FindingEvent(AgentEvent):
+    """New finding registered."""
+    def __init__(self, finding: Finding):
+        super().__init__("finding", finding=finding)
+
+
+class PlanEvent(AgentEvent):
+    """Plan created or updated."""
+    def __init__(self, plan: str):
+        super().__init__("plan_generated", plan=plan)
+
+
+class PhaseCompleteEvent(AgentEvent):
+    """Phase completed."""
+    def __init__(self, phase_name: str, next_phase: str):
+        super().__init__("phase_complete", phase_name=phase_name, next_phase=next_phase)
+
+
+class UsageEvent(AgentEvent):
+    """Token usage stats."""
+    def __init__(self, input_tokens: int = 0, output_tokens: int = 0,
+                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0):
+        super().__init__("usage", input_tokens=input_tokens, output_tokens=output_tokens,
+                         cache_read_tokens=cache_read_tokens, cache_creation_tokens=cache_creation_tokens)
+
+
+class ErrorEvent(AgentEvent):
+    """Error occurred."""
+    def __init__(self, message: str):
+        super().__init__("error", message=message)
+
+
+class DoneEvent(AgentEvent):
+    """Agent loop finished."""
+    def __init__(self):
+        super().__init__("done")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -140,9 +204,41 @@ class Agent:
         max_iterations: int = 50,
         tool_timeout: int = 300,
         session_timeout: int = 3600,
+        registry: DomainRegistry | None = None,
+        max_tool_calls_per_iteration: int = 20,
+        max_total_tool_calls: int = 500,
+        approval_callback: Any | None = None,
+        checkpoint_interval: int = 0,
+        session_manager: Any | None = None,
     ):
         self.router = router or LLMRouter(primary=Provider.DEEPSEEK)
         self.tools = tools or ToolRegistry()
+        self.registry = registry or DomainRegistry.default()
+
+        # Rate limiting
+        self.max_tool_calls_per_iteration = max_tool_calls_per_iteration
+        self.max_total_tool_calls = max_total_tool_calls
+        self._total_tool_calls = 0
+
+        # Human-in-the-loop: async callback that returns True to approve
+        # Signature: async def callback(tool_name: str, args: dict) -> bool
+        self._approval_callback = approval_callback
+
+        # Checkpoint/replay: save state every N iterations (0 = disabled)
+        self._checkpoint_interval = checkpoint_interval
+        self._session_manager = session_manager
+
+        # Always register create_finding and submit_analysis so LLM sees them
+        if "create_finding" not in self.tools.tools:
+            async def _noop_create_finding(**kwargs: str) -> str:
+                return '{"registered": true}'  # Never actually called; agent intercepts
+            self.tools.register("create_finding", _noop_create_finding, CREATE_FINDING_SCHEMA)
+
+        if "submit_analysis" not in self.tools.tools:
+            async def _noop_submit_analysis(**kwargs: str) -> str:
+                return '{"registered": true}'  # Never actually called; agent intercepts
+            self.tools.register("submit_analysis", _noop_submit_analysis, SUBMIT_ANALYSIS_SCHEMA)
+
         self.max_iterations = max_iterations
         self.tool_timeout = tool_timeout
         self.session_timeout = session_timeout
@@ -153,6 +249,7 @@ class Agent:
 
         # Reasoning graph for multi-stage chain reasoning
         self.reasoning_graph = reasoning_graph or ReasoningGraph()
+        self._pending_graph_paths: list = []  # Newly activated paths for prompt injection
 
         # Circuit breaker: Track repeated errors
         self.error_counter: dict[str, int] = {}
@@ -160,7 +257,10 @@ class Agent:
 
         # Loop detection: Track recent tool calls
         self._recent_tool_hashes: deque[str] = deque(maxlen=10)
-        self._loop_threshold = 1  # Block on first repeat
+        self._loop_threshold = 2  # Allow one retry, block on second repeat
+
+        # Phase reflection storage (macro-reflection at end of phase)
+        self._last_phase_reflection: str = ""
 
         # Load base system prompt
         self._base_system_prompt = self._load_system_prompt()
@@ -202,12 +302,28 @@ class Agent:
         if graph_ctx:
             parts.append("\n\n---\n\n" + graph_ctx)
 
+        # Graph-activated path suggestions for planner coordination
+        if self._pending_graph_paths:
+            path_lines = ["\n\n---\n\n## Newly Activated Reasoning Paths"]
+            path_lines.append("The following escalation paths are now available based on confirmed findings:")
+            for path in self._pending_graph_paths[:3]:
+                path_lines.append(f"- **{path.name}** ({path.impact} impact): {path.description}")
+            path_lines.append("\nConsider adjusting your approach to pursue these paths.")
+            parts.append("\n".join(path_lines))
+
         # Escalation chains for confirmed findings
         confirmed = self.state.profile.get_confirmed()
         for hyp in confirmed[:3]:  # Limit to avoid token bloat
             chain_text = format_chain_for_prompt(hyp.hypothesis_type)
             if chain_text:
                 parts.append("\n" + chain_text)
+
+        # Phase reflection (macro-reflection from previous phase)
+        if self._last_phase_reflection:
+            parts.append(
+                "\n\n---\n\n## Previous Phase Reflection\n\n"
+                + self._last_phase_reflection
+            )
 
         # Context-aware knowledge injection
         current_phase = ""
@@ -236,16 +352,216 @@ class Agent:
 
     def _get_tool_timeout(self, tool_name: str) -> int:
         """Get adaptive timeout for a tool."""
-        return TOOL_TIMEOUTS.get(tool_name, self.tool_timeout)
+        return self.registry.tool_timeouts.get(tool_name, self.tool_timeout)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Overridable Step Methods
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _do_context_management(self) -> None:
+        """Step 1: Trim context if needed. Override for custom budget strategy."""
+        needs_trim, tokens_before = should_trim_context(
+            self.state.messages, threshold=25, max_tokens=80000
+        )
+        if needs_trim:
+            msgs_before = len(self.state.messages)
+            self.state.messages = smart_trim_context(
+                self.state.messages, max_tokens=80000, recent_window=12,
+            )
+            tokens_after = sum(
+                estimate_tokens(msg.get("content", ""))
+                for msg in self.state.messages
+            )
+            logger.info(
+                f"Context trimmed: {msgs_before}→{len(self.state.messages)} msgs, "
+                f"~{tokens_before:,}→{tokens_after:,} tokens"
+            )
+
+    async def _do_llm_call(
+        self, system_prompt: str
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Step 2: Stream LLM response. Override for custom LLM interaction.
+
+        Yields AgentEvent("text", ...) for streaming tokens.
+        Sets self._last_text_buffer, self._last_tool_calls, self._last_usage.
+        """
+        self._last_text_buffer = ""
+        self._last_tool_calls = []
+        self._last_usage = {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        }
+
+        async for chunk in self.router.stream(
+            messages=self.state.messages,
+            tools=self.tools.get_schemas(),
+            system=system_prompt,
+            task_type=TaskType.TOOL_USE,
+        ):
+            if chunk.content:
+                self._last_text_buffer += chunk.content
+                yield AgentEvent("text", content=chunk.content)
+            if chunk.tool_call:
+                self._last_tool_calls.append(chunk.tool_call)
+            if chunk.input_tokens or chunk.cache_read_tokens:
+                self._last_usage["input_tokens"] += chunk.input_tokens
+                self._last_usage["output_tokens"] += chunk.output_tokens
+                self._last_usage["cache_read_tokens"] += chunk.cache_read_tokens
+                self._last_usage["cache_creation_tokens"] += chunk.cache_creation_tokens
+            if chunk.done:
+                break
+
+    async def _do_tool_execution(self, tool_calls: list[dict]) -> list[tuple[dict, str]]:
+        """Step 3: Execute tool calls in parallel. Override for custom execution.
+
+        Returns list of (tool_call_dict, result_string) tuples.
+        """
+        async def _exec_one(tc: dict) -> tuple[dict, str]:
+            timeout = self._get_tool_timeout(tc["name"])
+            try:
+                r = await asyncio.wait_for(
+                    self.tools.call(tc["name"], tc["arguments"]),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                logger.error(f"Tool timeout: {tc['name']} exceeded {timeout}s")
+                r = (
+                    f"Error: Tool '{tc['name']}' timed out after {timeout} seconds. "
+                    "Try with smaller scope or different approach."
+                )
+            except Exception as e:
+                logger.error(f"Tool execution error: {tc['name']}: {e}", exc_info=True)
+                r = f"Error executing tool: {str(e)}"
+            return tc, r
+
+        raw_results = await asyncio.gather(
+            *[_exec_one(tc) for tc in tool_calls],
+            return_exceptions=True,
+        )
+
+        results: list[tuple[dict, str]] = []
+        for item in raw_results:
+            if isinstance(item, BaseException):
+                logger.error(f"Unexpected error in parallel tool execution: {item}")
+                continue
+            results.append(item)
+        return results
+
+    async def _do_post_tool_processing(
+        self, tc: dict, result: str
+    ) -> tuple[str, str | None, str | None]:
+        """Step 4: Process a single tool result. Override for custom post-processing.
+
+        Args:
+            tc: Tool call dict {id, name, arguments}
+            result: Raw tool result string
+
+        Returns:
+            (processed_content, reflection_text, recovery_guidance)
+        """
+        # Extractor
+        try:
+            run_extractor(tc["name"], self.state.profile, result, tc.get("arguments", {}))
+        except Exception as e:
+            logger.warning(f"Extractor failed for {tc['name']}: {e}")
+
+        # Planner update
+        if self.state.plan and self.state.plan.objective:
+            summary = result[:200] if isinstance(result, str) else str(result)[:200]
+            failed = self._is_failure(tc["name"], result)
+            self.state.plan.mark_step_complete(tc["name"], summary, is_failure=failed)
+            if failed:
+                self.state.plan.record_failure(tc["name"])
+            else:
+                self.state.plan.reset_failure_count()
+
+        # Truncate + sanitize
+        tool_result_content = self._truncate_tool_result(tc["name"], result)
+        tool_result_content = self._sanitize_tool_output(tc["name"], tool_result_content)
+        if isinstance(tool_result_content, dict):
+            tool_result_content = json.dumps(tool_result_content, indent=2)
+
+        # Async reflection (supports both sync and async reflectors)
+        reflection_text = None
+        try:
+            r = await reflect_on_result_async(tc["name"], tc["arguments"], result, self.state.profile)
+            if r:
+                reflection_text = r
+        except Exception as e:
+            logger.warning(f"Reflection failed: {e}")
+
+        # Recovery guidance
+        guidance = None
+        if self._is_failure(tc["name"], result):
+            guidance = inject_recovery_guidance(tc["name"], result)
+
+        return tool_result_content, reflection_text, guidance
+
+    def _check_termination(self, text_buffer: str) -> bool:
+        """Step 5: Check if agent should stop. Override for custom termination logic.
+
+        Returns True if agent should terminate.
+        """
+        done_indicators = self._get_done_indicators()
+        text_lower = text_buffer.lower()
+        is_done = any(indicator in text_lower for indicator in done_indicators)
+
+        plan_done = self.state.plan and self.state.plan.is_complete()
+
+        # Terminate after 3+ consecutive text-only responses
+        consecutive_text = 0
+        for msg in reversed(self.state.messages):
+            if isinstance(msg.get("content"), str) and msg.get("role") == "assistant":
+                consecutive_text += 1
+            else:
+                break
+
+        return is_done or plan_done or consecutive_text >= 3
+
+    async def _check_phase_advancement(self) -> tuple[str, str] | None:
+        """Check if plan phase should advance. Returns (completed, next) or None.
+
+        When a phase completes, generates a macro-reflection via LLM
+        and stores it for injection into the next phase's context.
+        """
+        if not (self.state.plan and self.state.plan.objective):
+            return None
+        current = self.state.plan.current_phase()
+        if not current:
+            return None
+        all_done = all(
+            s.status.value in ("complete", "skipped") for s in current.steps
+        )
+        if all_done:
+            completed_name = current.name
+
+            # Generate macro-reflection for the completed phase
+            try:
+                reflection = await generate_phase_reflection(
+                    current, self.state.profile, self.router,
+                )
+                if reflection:
+                    self._last_phase_reflection = reflection
+            except Exception as e:
+                logger.debug(f"Phase reflection generation failed: {e}")
+
+            self.state.plan.advance_phase()
+            next_phase = self.state.plan.current_phase()
+            return completed_name, next_phase.name if next_phase else ""
+        return None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Main Loop — orchestrates the overridable steps
+    # ═══════════════════════════════════════════════════════════════════
 
     async def run(self, user_input: str) -> AsyncGenerator[AgentEvent, None]:
         """Run agent loop with user input.
 
         Yields AgentEvent objects for the CLI/UI to render.
+        The loop calls overridable step methods — subclass those for
+        custom behaviour without rewriting the entire loop.
         """
         self.is_running = True
-
-        # Add user message
         self.state.add_message("user", user_input)
 
         # Generate task plan if this is a new objective
@@ -264,248 +580,189 @@ class Agent:
                     yield AgentEvent("paused")
                     break
 
-                # Smart context trimming
-                needs_trim, tokens_before = should_trim_context(
-                    self.state.messages, threshold=25, max_tokens=80000
-                )
-                if needs_trim:
-                    msgs_before = len(self.state.messages)
-                    self.state.messages = smart_trim_context(
-                        self.state.messages,
-                        max_tokens=80000,
-                        recent_window=12,
-                    )
-                    tokens_after = sum(
-                        estimate_tokens(msg.get("content", ""))
-                        for msg in self.state.messages
-                    )
-                    logger.info(
-                        f"Context trimmed: {msgs_before}→{len(self.state.messages)} msgs, "
-                        f"~{tokens_before:,}→{tokens_after:,} tokens"
-                    )
+                # Step 1: Context management
+                self._do_context_management()
 
-                # Build dynamic system prompt
+                # Step 2: Build prompt + LLM call
                 system_prompt = self._build_dynamic_system_prompt()
-
-                # Call LLM
-                text_buffer = ""
-                tool_calls = []
-                usage_stats = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read_tokens": 0,
-                    "cache_creation_tokens": 0,
-                }
+                self._pending_graph_paths.clear()
 
                 try:
-                    async for chunk in self.router.stream(
-                        messages=self.state.messages,
-                        tools=self.tools.get_schemas(),
-                        system=system_prompt,
-                        task_type=TaskType.TOOL_USE,
-                    ):
-                        if chunk.content:
-                            text_buffer += chunk.content
-                            yield AgentEvent("text", content=chunk.content)
-
-                        if chunk.tool_call:
-                            tool_calls.append(chunk.tool_call)
-
-                        if chunk.input_tokens or chunk.cache_read_tokens:
-                            usage_stats["input_tokens"] += chunk.input_tokens
-                            usage_stats["output_tokens"] += chunk.output_tokens
-                            usage_stats["cache_read_tokens"] += chunk.cache_read_tokens
-                            usage_stats["cache_creation_tokens"] += chunk.cache_creation_tokens
-
-                        if chunk.done:
-                            break
-
+                    async for event in self._do_llm_call(system_prompt):
+                        yield event
                 except Exception as e:
                     error_msg = str(e)
                     logger.error(f"LLM streaming error: {error_msg}", exc_info=True)
-
                     self.error_counter[error_msg] = self.error_counter.get(error_msg, 0) + 1
-
                     if self.error_counter[error_msg] >= self.max_repeated_errors:
                         logger.error(f"Circuit breaker triggered: Same error {self.max_repeated_errors} times")
-                        yield AgentEvent(
-                            "error",
-                            message=(
-                                f"STOPPING: Repeated LLM error detected.\n\n"
-                                f"Error: {error_msg}\n\n"
-                                f"Check your API keys and configuration."
-                            ),
-                        )
+                        yield AgentEvent("error", message=(
+                            f"STOPPING: Repeated LLM error detected.\n\n"
+                            f"Error: {error_msg}\n\n"
+                            f"Check your API keys and configuration."
+                        ))
                         break
-
                     yield AgentEvent("error", message=f"LLM API error: {error_msg}")
                     continue
+
+                text_buffer = self._last_text_buffer
+                tool_calls = self._last_tool_calls
+                usage_stats = self._last_usage
 
                 # Emit usage stats
                 if usage_stats["input_tokens"] or usage_stats["cache_read_tokens"]:
                     yield AgentEvent("usage", **usage_stats)
 
-                # Check for findings in text
+                # Check for findings in text (supports multiple per response)
                 if text_buffer:
-                    finding = self._extract_finding(text_buffer)
-                    if finding:
+                    for finding in self._extract_all_findings(text_buffer):
                         self.state.add_finding(finding)
-                        self.reasoning_graph.mark_discovered(finding.title)
+                        activated_paths = self.reasoning_graph.mark_discovered(finding.title)
+                        if activated_paths:
+                            self._pending_graph_paths.extend(activated_paths[:3])
                         yield AgentEvent("finding", finding=finding)
 
-                # Process tool calls
+                # Step 3-4: Process tool calls
                 if tool_calls:
-                    # Add assistant message with tool calls
-                    if text_buffer:
-                        content = [{"type": "text", "text": text_buffer}]
-                        content.extend([
-                            {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["arguments"]}
-                            for tc in tool_calls
-                        ])
-                        self.state.add_message("assistant", content)
-                    else:
-                        self.state.add_message("assistant", [
-                            {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["arguments"]}
-                            for tc in tool_calls
-                        ])
+                    # Rate limiting: per-iteration cap
+                    if len(tool_calls) > self.max_tool_calls_per_iteration:
+                        logger.warning(
+                            f"Rate limit: {len(tool_calls)} tool calls in one iteration "
+                            f"(max {self.max_tool_calls_per_iteration}). Truncating."
+                        )
+                        tool_calls = tool_calls[:self.max_tool_calls_per_iteration]
 
-                    # Execute tools
+                    # Rate limiting: total cap
+                    if self._total_tool_calls >= self.max_total_tool_calls:
+                        logger.error(f"Rate limit: {self._total_tool_calls} total tool calls reached max ({self.max_total_tool_calls})")
+                        yield AgentEvent("error", message=f"Tool call limit reached ({self.max_total_tool_calls} total calls)")
+                        break
+
+                    # Add assistant message with tool calls
+                    content_items = []
+                    if text_buffer:
+                        content_items.append({"type": "text", "text": text_buffer})
+                    content_items.extend([
+                        {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["arguments"]}
+                        for tc in tool_calls
+                    ])
+                    self.state.add_message("assistant", content_items)
+
+                    # Separate intercepted vs executable
+                    intercepted: list[tuple[str, dict]] = []
+                    executable: list[dict] = []
                     for tc in tool_calls:
-                        # Loop detection
                         if self._detect_loop(tc["name"], tc["arguments"]):
+                            intercepted.append(("loop", tc))
+                        elif tc["name"] == "create_finding":
+                            intercepted.append(("finding", tc))
+                        elif tc["name"] == "submit_analysis":
+                            intercepted.append(("analysis", tc))
+                        else:
+                            executable.append(tc)
+
+                    # Handle intercepted calls
+                    for reason, tc in intercepted:
+                        if reason == "loop":
                             loop_msg = (
                                 f"LOOP DETECTED: '{tc['name']}' with same arguments was called recently. "
                                 "Try a DIFFERENT approach, tool, or parameter."
                             )
                             yield AgentEvent("tool_start", tool_name=tc["name"], arguments=tc["arguments"])
                             yield AgentEvent("tool_end", tool_name=tc["name"], tool_result=loop_msg)
-                            self.state.add_message("tool", {
-                                "tool_call_id": tc["id"],
-                                "content": loop_msg,
-                            })
-                            continue
-
-                        yield AgentEvent("tool_start", tool_name=tc["name"], arguments=tc["arguments"])
-
-                        # ── CREATE_FINDING: intercept and register ──
-                        if tc["name"] == "create_finding":
+                            self.state.add_message("tool", {"tool_call_id": tc["id"], "content": loop_msg})
+                        elif reason == "finding":
+                            yield AgentEvent("tool_start", tool_name=tc["name"], arguments=tc["arguments"])
                             finding = self._handle_create_finding(tc)
-                            result = json.dumps({
-                                "registered": True,
-                                "title": finding.title,
-                                "severity": finding.severity,
-                            })
+                            result = json.dumps({"registered": True, "title": finding.title, "severity": finding.severity})
                             yield AgentEvent("finding", finding=finding)
                             yield AgentEvent("tool_end", tool_name=tc["name"], tool_result=result)
-                            self.state.add_message("tool", {
-                                "tool_call_id": tc["id"],
-                                "content": result,
-                            })
-                            continue
+                            self.state.add_message("tool", {"tool_call_id": tc["id"], "content": result})
+                        elif reason == "analysis":
+                            yield AgentEvent("tool_start", tool_name=tc["name"], arguments=tc["arguments"])
+                            findings_list, result = self._handle_submit_analysis(tc)
+                            for f in findings_list:
+                                yield AgentEvent("finding", finding=f)
+                            yield AgentEvent("tool_end", tool_name=tc["name"], tool_result=result)
+                            self.state.add_message("tool", {"tool_call_id": tc["id"], "content": result})
 
-                        # Execute with adaptive timeout
-                        timeout = self._get_tool_timeout(tc["name"])
-                        try:
-                            result = await asyncio.wait_for(
-                                self.tools.call(tc["name"], tc["arguments"]),
-                                timeout=timeout,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.error(f"Tool timeout: {tc['name']} exceeded {timeout}s")
-                            result = f"Error: Tool '{tc['name']}' timed out after {timeout} seconds. Try with smaller scope or different approach."
-                        except Exception as e:
-                            logger.error(f"Tool execution error: {tc['name']}: {e}", exc_info=True)
-                            result = f"Error executing tool: {str(e)}"
+                    # Human-in-the-loop: check if any tool requires approval
+                    if executable and self._approval_callback:
+                        approved: list[dict] = []
+                        for tc in executable:
+                            tool_schema = self.tools.tools.get(tc["name"], {}).get("schema", {})
+                            if tool_schema.get("requires_approval", False):
+                                try:
+                                    ok = await self._approval_callback(tc["name"], tc["arguments"])
+                                except Exception:
+                                    ok = False
+                                if not ok:
+                                    msg = f"Tool '{tc['name']}' requires approval — denied by user."
+                                    yield AgentEvent("tool_start", tool_name=tc["name"], arguments=tc["arguments"])
+                                    yield AgentEvent("tool_end", tool_name=tc["name"], tool_result=msg)
+                                    self.state.add_message("tool", {"tool_call_id": tc["id"], "content": msg})
+                                    continue
+                            approved.append(tc)
+                        executable = approved
 
-                        yield AgentEvent("tool_end", tool_name=tc["name"], tool_result=result)
+                    # Execute normal tools in parallel
+                    if executable:
+                        for tc in executable:
+                            yield AgentEvent("tool_start", tool_name=tc["name"], arguments=tc["arguments"])
 
-                        # ── EXTRACTOR: Update DomainProfile ──
-                        try:
-                            run_extractor(tc["name"], self.state.profile, result, tc.get("arguments", {}))
-                        except Exception as e:
-                            logger.warning(f"Extractor failed for {tc['name']}: {e}")
+                        exec_results = await self._do_tool_execution(executable)
+                        self._total_tool_calls += len(exec_results)
 
-                        # ── PLANNER: Mark step complete ──
-                        if self.state.plan and self.state.plan.objective:
-                            summary = result[:200] if isinstance(result, str) else str(result)[:200]
-                            failed = self._is_failure(tc["name"], result)
-                            self.state.plan.mark_step_complete(tc["name"], summary, is_failure=failed)
+                        for tc, result in exec_results:
+                            yield AgentEvent("tool_end", tool_name=tc["name"], tool_result=result)
 
-                        # Build tool result content
-                        tool_result_content = self._truncate_tool_result(tc["name"], result)
+                            # Post-processing (Step 4)
+                            content, reflection, guidance = await self._do_post_tool_processing(tc, result)
 
-                        if isinstance(tool_result_content, dict):
-                            tool_result_content = json.dumps(tool_result_content, indent=2)
+                            # Replanning check
+                            if self.state.plan and self.state.plan.needs_replan():
+                                try:
+                                    self.state.plan = await generate_plan_with_llm(
+                                        self.state.plan.objective, self.state.profile, self.router
+                                    )
+                                    yield AgentEvent("plan_generated", plan=self.state.plan.to_prompt_summary())
+                                except Exception:
+                                    pass
 
-                        # ── REFLECTION: Strategic insight ──
-                        reflection_text = ""
-                        try:
-                            reflection_text = reflect_on_result(
-                                tc["name"], tc["arguments"], result, self.state.profile
-                            )
-                        except Exception as e:
-                            logger.warning(f"Reflection failed: {e}")
+                            if guidance:
+                                content = f"{content}\n\n{guidance}"
+                                yield AgentEvent("reflection", tool_name=tc["name"], guidance=guidance)
+                            if reflection:
+                                content = f"{content}\n\n---\n**Reflection:**\n{reflection}"
 
-                        # Check for failure and inject recovery guidance
-                        if self._is_failure(tc["name"], result):
-                            guidance = inject_recovery_guidance(tc["name"], result)
-                            tool_result_content = f"{tool_result_content}\n\n{guidance}"
-                            yield AgentEvent("reflection", tool_name=tc["name"], guidance=guidance)
+                            self.state.add_message("tool", {"tool_call_id": tc["id"], "content": content})
 
-                        # Append reflection
-                        if reflection_text:
-                            tool_result_content = f"{tool_result_content}\n\n---\n**Reflection:**\n{reflection_text}"
-
-                        # Add tool message
-                        self.state.add_message("tool", {
-                            "tool_call_id": tc["id"],
-                            "content": tool_result_content,
-                        })
-
-                    # Check if plan phase should advance
-                    if self.state.plan and self.state.plan.objective:
-                        current = self.state.plan.current_phase()
-                        if current:
-                            all_done = all(
-                                s.status.value in ("complete", "skipped")
-                                for s in current.steps
-                            )
-                            if all_done:
-                                completed_name = current.name
-                                self.state.plan.advance_phase()
-                                next_phase = self.state.plan.current_phase()
-                                next_name = next_phase.name if next_phase else ""
-                                yield AgentEvent(
-                                    "phase_complete",
-                                    phase_name=completed_name,
-                                    next_phase=next_name,
-                                )
+                    # Check phase advancement (async for macro-reflection)
+                    advancement = await self._check_phase_advancement()
+                    if advancement:
+                        yield AgentEvent("phase_complete", phase_name=advancement[0], next_phase=advancement[1])
 
                     continue
 
                 # No tool calls — text-only response
                 if text_buffer and not tool_calls:
                     self.state.add_message("assistant", text_buffer)
-
-                    # ── TERMINATION DETECTION ──
-                    done_indicators = self._get_done_indicators()
-                    text_lower = text_buffer.lower()
-                    is_done = any(indicator in text_lower for indicator in done_indicators)
-
-                    plan_done = self.state.plan and self.state.plan.is_complete()
-
-                    # Terminate after 3+ consecutive text-only responses
-                    consecutive_text = 0
-                    for msg in reversed(self.state.messages):
-                        if isinstance(msg.get("content"), str) and msg.get("role") == "assistant":
-                            consecutive_text += 1
-                        else:
-                            break
-
-                    if is_done or plan_done or consecutive_text >= 3:
+                    if self._check_termination(text_buffer):
                         break
-                    else:
-                        continue
+                    continue
+
+                # Periodic checkpoint
+                if (
+                    self._checkpoint_interval > 0
+                    and self._session_manager
+                    and (iteration + 1) % self._checkpoint_interval == 0
+                ):
+                    try:
+                        self._session_manager.save_checkpoint(
+                            self.state, iteration + 1
+                        )
+                    except Exception as e:
+                        logger.debug(f"Checkpoint save failed: {e}")
 
                 # Safety: empty response
                 if not text_buffer and not tool_calls:
@@ -566,42 +823,51 @@ class Agent:
         return any(ind in result_lower for ind in failure_indicators)
 
     def _extract_finding(self, text: str) -> Finding | None:
-        """Extract finding from agent text.
+        """Extract first finding from agent text (returns first for backward compat).
 
         Looks for pattern: [FINDING: SEVERITY] Title
         Override for custom finding patterns.
         """
-        match = re.search(r'\[FINDING:\s*(\w+)\]\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-        if not match:
-            return None
+        findings = self._extract_all_findings(text)
+        return findings[0] if findings else None
 
-        severity = match.group(1).lower()
-        title = match.group(2).strip()
+    def _extract_all_findings(self, text: str) -> list[Finding]:
+        """Extract ALL findings from agent text.
 
-        description = ""
-        evidence = ""
+        Looks for pattern: [FINDING: SEVERITY] Title
+        Supports multiple findings in a single response.
+        """
+        findings: list[Finding] = []
+        for match in re.finditer(r'\[FINDING:\s*(\w+)\]\s*(.+?)(?:\n|$)', text, re.IGNORECASE):
+            severity = match.group(1).lower()
+            title = match.group(2).strip()
 
-        desc_match = re.search(r'\*\*Description\*\*:\s*(.+?)(?:\n\*\*|\n\n|$)', text, re.DOTALL)
-        if desc_match:
-            description = desc_match.group(1).strip()
+            description = ""
+            evidence = ""
 
-        ev_match = re.search(r'\*\*Evidence\*\*:\s*(.+?)(?:\n\*\*|\n\n|$)', text, re.DOTALL)
-        if ev_match:
-            evidence = ev_match.group(1).strip()
+            # Search for description/evidence after this finding's position
+            remaining = text[match.start():]
+            desc_match = re.search(r'\*\*Description\*\*:\s*(.+?)(?:\n\*\*|\n\n|$)', remaining, re.DOTALL)
+            if desc_match:
+                description = desc_match.group(1).strip()
 
-        title = self._clean_markup(title)
-        description = self._clean_markup(description)
-        evidence = self._clean_markup(evidence)
+            ev_match = re.search(r'\*\*Evidence\*\*:\s*(.+?)(?:\n\*\*|\n\n|$)', remaining, re.DOTALL)
+            if ev_match:
+                evidence = ev_match.group(1).strip()
 
-        # Hook for domain-specific finding processing
-        self._on_finding(title, severity, description, evidence)
+            title = self._clean_markup(title)
+            description = self._clean_markup(description)
+            evidence = self._clean_markup(evidence)
 
-        return Finding(
-            title=title,
-            severity=severity,
-            description=description or title,
-            evidence=evidence,
-        )
+            self._on_finding(title, severity, description, evidence)
+
+            findings.append(Finding(
+                title=title,
+                severity=severity,
+                description=description or title,
+                evidence=evidence,
+            ))
+        return findings
 
     def _on_finding(self, title: str, severity: str, description: str, evidence: str):
         """Hook called when a finding is extracted. Override for domain logic.
@@ -620,8 +886,54 @@ class Agent:
             evidence=args.get("evidence", ""),
         )
         self.state.add_finding(finding)
-        self.reasoning_graph.mark_discovered(finding.title)
+        activated_paths = self.reasoning_graph.mark_discovered(finding.title)
+        if activated_paths:
+            self._pending_graph_paths.extend(activated_paths[:3])
         return finding
+
+    def _handle_submit_analysis(self, tc: dict) -> tuple[list[Finding], str]:
+        """Handle the submit_analysis tool call (structured output).
+
+        Processes the structured analysis: registers findings, adds hypotheses
+        to the domain profile, and returns a summary.
+        """
+        from omnigent.domain_profile import Hypothesis
+
+        args = tc.get("arguments", {})
+        registered_findings: list[Finding] = []
+
+        # Process findings from structured output
+        for f_data in args.get("findings", []):
+            finding = Finding(
+                title=f_data.get("title", "Untitled"),
+                severity=f_data.get("severity", "info"),
+                description=f_data.get("description", ""),
+                evidence=f_data.get("evidence", ""),
+            )
+            self.state.add_finding(finding)
+            activated_paths = self.reasoning_graph.mark_discovered(finding.title)
+            if activated_paths:
+                self._pending_graph_paths.extend(activated_paths[:3])
+            registered_findings.append(finding)
+
+        # Process hypotheses
+        for h_data in args.get("hypotheses", []):
+            hyp = Hypothesis(
+                hypothesis_type=h_data.get("hypothesis_type", ""),
+                location=h_data.get("location", ""),
+                confidence=h_data.get("confidence", 0.5),
+                evidence=h_data.get("evidence", ""),
+            )
+            self.state.profile.add_hypothesis(hyp)
+
+        result = json.dumps({
+            "registered": True,
+            "findings_count": len(registered_findings),
+            "hypotheses_count": len(args.get("hypotheses", [])),
+            "step_summary": args.get("step_summary", ""),
+            "next_action": args.get("next_action", ""),
+        })
+        return registered_findings, result
 
     def _clean_markup(self, text: str) -> str:
         """Remove Rich markup tags from text."""
@@ -651,6 +963,31 @@ class Agent:
         head = result_str[:head_size]
         tail = result_str[-tail_size:]
         return f"{head}\n\n... [TRUNCATED {len(result_str) - max_chars} characters] ...\n\n{tail}"
+
+    def _sanitize_tool_output(self, tool_name: str, output: str) -> str:
+        """Sanitize tool output to prevent prompt injection.
+
+        Strips patterns that could be mistaken for agent findings or
+        system instructions embedded in tool results.
+        """
+        if not isinstance(output, str):
+            return output
+
+        # Neutralize finding-like patterns from tool output
+        sanitized = re.sub(
+            r'\[FINDING:\s*\w+\]',
+            '[TOOL_OUTPUT_FINDING_PATTERN]',
+            output,
+            flags=re.IGNORECASE,
+        )
+        # Neutralize system-instruction-like patterns
+        sanitized = re.sub(
+            r'\[SYSTEM\]:\s*',
+            '[TOOL_OUTPUT_SYSTEM_PATTERN]: ',
+            sanitized,
+            flags=re.IGNORECASE,
+        )
+        return sanitized
 
     def pause(self):
         """Pause agent execution."""

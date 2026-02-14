@@ -32,7 +32,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from omnigent.domain_profile import DomainProfile
 
@@ -60,6 +60,7 @@ class TaskStep:
     tool_hint: str = ""
     status: PhaseStatus = PhaseStatus.PENDING
     result_summary: str = ""
+    hypothesis_ref: str = ""  # Link to Hypothesis (type:location)
 
 
 @dataclass
@@ -70,6 +71,7 @@ class TaskPhase:
     steps: list[TaskStep] = field(default_factory=list)
     status: PhaseStatus = PhaseStatus.PENDING
     skip_condition: str = ""
+    consecutive_failures: int = 0
 
     def progress(self) -> str:
         total = len(self.steps)
@@ -85,26 +87,40 @@ class TaskPlan:
     created_at: str = ""
 
     def current_phase(self) -> TaskPhase | None:
-        """Get the currently active phase."""
+        """Get the currently active phase, evaluating skip_conditions."""
         for phase in self.phases:
             if phase.status == PhaseStatus.ACTIVE:
                 return phase
-        # If no phase is active, activate the first pending
+        # If no phase is active, activate the first pending (skip if condition met)
         for phase in self.phases:
             if phase.status == PhaseStatus.PENDING:
+                if phase.skip_condition and self._evaluate_skip_condition(phase):
+                    phase.status = PhaseStatus.SKIPPED
+                    for step in phase.steps:
+                        step.status = PhaseStatus.SKIPPED
+                        step.result_summary = f"Skipped: {phase.skip_condition}"
+                    continue
                 phase.status = PhaseStatus.ACTIVE
                 return phase
         return None
 
     def advance_phase(self):
-        """Mark current phase complete and activate next."""
+        """Mark current phase complete and activate next (evaluating skip_conditions)."""
         for i, phase in enumerate(self.phases):
             if phase.status == PhaseStatus.ACTIVE:
                 phase.status = PhaseStatus.COMPLETE
                 for j in range(i + 1, len(self.phases)):
-                    if self.phases[j].status == PhaseStatus.PENDING:
-                        self.phases[j].status = PhaseStatus.ACTIVE
-                        return
+                    candidate = self.phases[j]
+                    if candidate.status != PhaseStatus.PENDING:
+                        continue
+                    if candidate.skip_condition and self._evaluate_skip_condition(candidate):
+                        candidate.status = PhaseStatus.SKIPPED
+                        for step in candidate.steps:
+                            step.status = PhaseStatus.SKIPPED
+                            step.result_summary = f"Skipped: {candidate.skip_condition}"
+                        continue
+                    candidate.status = PhaseStatus.ACTIVE
+                    return
                 return
 
     def skip_phase(self, phase_name: str, reason: str = ""):
@@ -134,6 +150,63 @@ class TaskPlan:
                     step.status = PhaseStatus.COMPLETE
                     step.result_summary = result_summary[:200]
                     return
+
+    def record_failure(self, tool_name: str) -> None:
+        """Record a tool failure in the current phase for replanning detection."""
+        current = self.current_phase()
+        if current:
+            current.consecutive_failures += 1
+
+    def reset_failure_count(self) -> None:
+        """Reset failure counter on successful tool execution."""
+        current = self.current_phase()
+        if current:
+            current.consecutive_failures = 0
+
+    def needs_replan(self, threshold: int = 3) -> bool:
+        """Check if current phase has too many consecutive failures to warrant replanning."""
+        current = self.current_phase()
+        return current is not None and current.consecutive_failures >= threshold
+
+    def _evaluate_skip_condition(self, phase: TaskPhase) -> bool:
+        """Evaluate a phase's skip_condition against completed phases.
+
+        Skip conditions reference completed phase names or step results.
+        Supported patterns:
+          - "phase:<name>:complete" — skip if phase <name> is complete
+          - "phase:<name>:skipped" — skip if phase <name> was skipped
+          - "no_findings" — skip if no steps in previous phases produced results
+          - Any other string — treated as keyword search in completed step summaries
+        """
+        cond = phase.skip_condition.strip().lower()
+        if not cond:
+            return False
+
+        if cond.startswith("phase:"):
+            parts = cond.split(":")
+            if len(parts) >= 3:
+                ref_name = parts[1]
+                ref_status = parts[2]
+                for p in self.phases:
+                    if p.name.lower() == ref_name:
+                        return p.status.value == ref_status
+            return False
+
+        if cond == "no_findings":
+            for p in self.phases:
+                if p.status == PhaseStatus.COMPLETE:
+                    for step in p.steps:
+                        if step.result_summary and step.status == PhaseStatus.COMPLETE:
+                            return False
+            return True
+
+        # Keyword search in completed step summaries
+        for p in self.phases:
+            if p.status == PhaseStatus.COMPLETE:
+                for step in p.steps:
+                    if cond in step.result_summary.lower():
+                        return True
+        return False
 
     def is_complete(self) -> bool:
         return all(p.status in (PhaseStatus.COMPLETE, PhaseStatus.SKIPPED) for p in self.phases)
@@ -190,6 +263,7 @@ class TaskPlan:
                     tool_hint=s.get("tool_hint", ""),
                     status=PhaseStatus(s.get("status", "pending")),
                     result_summary=s.get("result_summary", ""),
+                    hypothesis_ref=s.get("hypothesis_ref", ""),
                 )
                 steps.append(step)
             phase = TaskPhase(
@@ -198,6 +272,7 @@ class TaskPlan:
                 steps=steps,
                 status=PhaseStatus(phase_data.get("status", "pending")),
                 skip_condition=phase_data.get("skip_condition", ""),
+                consecutive_failures=phase_data.get("consecutive_failures", 0),
             )
             plan.phases.append(phase)
         return plan
@@ -299,6 +374,74 @@ Rules:
 - Output ONLY valid JSON — no markdown fences, no commentary.
 - JSON schema: {"phases": [{"name": str, "objective": str, "steps": [{"description": str, "tool_hint": str}]}]}
 """
+
+
+PHASE_REFLECTION_PROMPT = """\
+You are an expert analyst reviewing the results of a completed phase.
+
+Given the phase details and results below, provide a BRIEF reflection (3-5 sentences):
+1. What was accomplished in this phase?
+2. Were there any unexpected findings or failures?
+3. Should the plan be adjusted for the next phase?
+4. What is the most important thing to focus on next?
+
+Output ONLY the reflection text, no JSON or formatting.
+"""
+
+
+async def generate_phase_reflection(
+    phase: TaskPhase,
+    profile: DomainProfile,
+    router: LLMRouter,
+) -> str:
+    """Generate a macro-reflection summary at the end of a phase.
+
+    Called when advance_phase() completes a phase. The reflection is
+    injected into the system prompt for the next phase to guide strategy.
+
+    Returns:
+        Reflection text, or empty string on failure.
+    """
+    from omnigent.router import TaskType
+
+    step_summaries = []
+    for step in phase.steps:
+        status = step.status.value
+        summary = step.result_summary or "no result"
+        step_summaries.append(f"  - [{status}] {step.description}: {summary}")
+
+    profile_summary = profile.to_prompt_summary()
+
+    user_prompt = (
+        f"## Completed Phase: {phase.name}\n"
+        f"**Objective**: {phase.objective}\n\n"
+        f"### Step Results:\n" + "\n".join(step_summaries) + "\n\n"
+        f"### Current Knowledge:\n{profile_summary}\n\n"
+        "Provide your reflection."
+    )
+
+    try:
+        text = ""
+        async with asyncio.timeout(30):
+            async for chunk in router.stream(
+                messages=[{"role": "user", "content": user_prompt}],
+                tools=None,
+                system=PHASE_REFLECTION_PROMPT,
+                task_type=TaskType.REFLECTION,
+            ):
+                if chunk.content:
+                    text += chunk.content
+                if chunk.done:
+                    break
+
+        text = text.strip()
+        if text:
+            logger.info(f"Phase reflection for '{phase.name}': {text[:100]}...")
+            return text
+    except Exception as e:
+        logger.warning(f"Phase reflection failed for '{phase.name}': {e}")
+
+    return ""
 
 
 async def generate_plan_with_llm(

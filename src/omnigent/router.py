@@ -11,12 +11,15 @@ This module is 100% domain-agnostic — no domain-specific logic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import random
+import uuid
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncGenerator
 
 import httpx
 from dotenv import load_dotenv
@@ -24,6 +27,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger("omnigent.router")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Provider Protocol — extend to add new LLM providers without modifying router
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class LLMProvider:
+    """Abstract base for LLM providers.
+
+    Subclass this to add a new provider (e.g., Gemini, Mistral, Groq)
+    without modifying LLMRouter. Register it via LLMRouter.register_provider().
+    """
+
+    async def stream(
+        self,
+        client: httpx.AsyncClient,
+        config: dict,
+        messages: list[dict],
+        tools: list[dict] | None,
+        system: str | list[dict] | None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Stream a response from this provider.
+
+        Args:
+            client: Shared httpx.AsyncClient
+            config: Provider config dict (base_url, model, api_key_env, etc.)
+            messages: Conversation messages
+            tools: Tool schemas (OpenAI format)
+            system: System prompt
+
+        Yields:
+            StreamChunk objects
+        """
+        raise NotImplementedError
+        # Make this an async generator
+        yield  # pragma: no cover
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -158,6 +198,17 @@ class LLMRouter:
             self.fallback = fallback
         self._client: httpx.AsyncClient | None = None
         self.current_provider: Provider = primary
+        # Custom provider implementations (override built-in streaming)
+        self._custom_providers: dict[Provider, LLMProvider] = {}
+
+    def register_provider(self, provider: Provider, impl: LLMProvider) -> None:
+        """Register a custom LLMProvider implementation for a provider.
+
+        This allows adding new providers (e.g., Gemini, Mistral) or replacing
+        the built-in OpenAI/Anthropic implementations without modifying router.py.
+        """
+        self._custom_providers[provider] = impl
+        logger.info(f"Registered custom provider: {provider.value} → {type(impl).__name__}")
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
@@ -194,6 +245,7 @@ class LLMRouter:
         system: str | list[dict] | None = None,
         task_type: TaskType | None = None,
         provider_override: Provider | None = None,
+        thinking_budget: int | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """
         Stream LLM response with real-time tokens.
@@ -204,7 +256,13 @@ class LLMRouter:
             system: System prompt (string or Anthropic cacheable format)
             task_type: Optional task type for smart routing
             provider_override: Force a specific provider
+            thinking_budget: Optional extended thinking budget (tokens) for Claude.
+                If None, uses automatic budget for PLANNING/ANALYSIS tasks with Claude.
+                Set to 0 to disable thinking.
         """
+        self._current_thinking_budget = thinking_budget
+        self._current_task_type = task_type
+
         if provider_override:
             selected = provider_override
         elif task_type:
@@ -222,7 +280,7 @@ class LLMRouter:
 
         for provider in providers:
             try:
-                async for chunk in self._stream_provider(provider, messages, tools, system):
+                async for chunk in self._stream_with_retry(provider, messages, tools, system):
                     yield chunk
                 return
             except Exception as e:
@@ -231,7 +289,7 @@ class LLMRouter:
                 if "400" in error_msg and provider == self.primary and system:
                     logger.warning(f"Got 400 from {provider}, retrying without system prompt...")
                     try:
-                        async for chunk in self._stream_provider(provider, messages, tools, None):
+                        async for chunk in self._stream_with_retry(provider, messages, tools, None):
                             yield chunk
                         return
                     except Exception as e2:
@@ -241,6 +299,42 @@ class LLMRouter:
                 if provider == providers[-1]:
                     raise Exception(f"All providers failed. Last error: {error_msg}")
 
+    async def _stream_with_retry(
+        self,
+        provider: Provider,
+        messages: list[dict],
+        tools: list[dict] | None,
+        system: str | list[dict] | None,
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Stream from provider with exponential backoff retry on transient errors."""
+        retryable_codes = {429, 500, 502, 503, 504}
+
+        for attempt in range(max_retries + 1):
+            try:
+                async for chunk in self._stream_provider(provider, messages, tools, system):
+                    yield chunk
+                return
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code not in retryable_codes or attempt == max_retries:
+                    raise
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(
+                    f"Retryable error {e.response.status_code} from {provider.value}, "
+                    f"retry {attempt + 1}/{max_retries} in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as e:
+                if attempt == max_retries:
+                    raise
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(
+                    f"Connection error from {provider.value}: {e}, "
+                    f"retry {attempt + 1}/{max_retries} in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+
     async def _stream_provider(
         self,
         provider: Provider,
@@ -248,8 +342,19 @@ class LLMRouter:
         tools: list[dict] | None,
         system: str | list[dict] | None,
     ) -> AsyncGenerator[StreamChunk, None]:
-        """Stream from specific provider."""
-        if provider == Provider.CLAUDE:
+        """Stream from specific provider.
+
+        Checks for a custom LLMProvider first, then falls back to
+        built-in OpenAI/Anthropic implementations.
+        """
+        if provider in self._custom_providers:
+            client = await self._get_client()
+            config = PROVIDERS.get(provider, {})
+            async for chunk in self._custom_providers[provider].stream(
+                client, config, messages, tools, system
+            ):
+                yield chunk
+        elif provider == Provider.CLAUDE:
             async for chunk in self._stream_anthropic(provider, messages, tools, system):
                 yield chunk
         else:
@@ -281,26 +386,11 @@ class LLMRouter:
             else:
                 system_text = system
 
-        # Build messages — handle system prompt injection for tools
+        # Build messages — always use native system message role
         all_messages = []
-        if system_text and not tools:
+        if system_text:
             all_messages.append({"role": "system", "content": system_text})
-            all_messages.extend(messages)
-        elif system_text and tools:
-            first_user_idx = next((i for i, m in enumerate(messages) if m.get("role") == "user"), 0)
-            if first_user_idx < len(messages):
-                first_user_content = messages[first_user_idx].get("content", "")
-                all_messages.extend(messages[:first_user_idx])
-                all_messages.append({
-                    "role": "user",
-                    "content": f"[SYSTEM]: {system_text}\n\n[USER]: {first_user_content}"
-                })
-                all_messages.extend(messages[first_user_idx + 1:])
-            else:
-                all_messages.extend(messages)
-                all_messages.append({"role": "user", "content": f"[SYSTEM]: {system_text}"})
-        else:
-            all_messages.extend(messages)
+        all_messages.extend(messages)
 
         # Normalize messages for OpenAI format
         normalized_messages = self._normalize_messages_openai(all_messages)
@@ -378,7 +468,11 @@ class LLMRouter:
                     for tc in tool_calls_buffer.values():
                         try:
                             args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                        except (json.JSONDecodeError, ValueError):
+                        except (json.JSONDecodeError, ValueError) as e:
+                            logger.warning(
+                                f"Malformed JSON in tool arguments for '{tc.get('name', '?')}': {e}. "
+                                f"Raw: {tc['arguments'][:200]}"
+                            )
                             args = {}
                         yield StreamChunk(
                             tool_call={"id": tc["id"], "name": tc["name"], "arguments": args},
@@ -405,12 +499,27 @@ class LLMRouter:
             "anthropic-beta": "prompt-caching-2024-07-31",
         }
 
+        # Determine thinking budget
+        thinking_budget = getattr(self, "_current_thinking_budget", None)
+        task_type = getattr(self, "_current_task_type", None)
+
+        # Auto-enable thinking for planning/analysis tasks if not explicitly disabled
+        if thinking_budget is None and task_type in (TaskType.PLANNING, TaskType.ANALYSIS):
+            thinking_budget = 10000  # Default thinking budget for complex tasks
+
         payload = {
             "model": config["model"],
-            "max_tokens": 4096,
+            "max_tokens": 16384 if thinking_budget else 4096,
             "messages": messages,
             "stream": True,
         }
+
+        # Extended thinking support
+        if thinking_budget and thinking_budget > 0:
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
 
         if system:
             if isinstance(system, list):
@@ -448,7 +557,18 @@ class LLMRouter:
 
                 event_type = data.get("type")
 
-                if event_type == "content_block_start":
+                if event_type == "message_start":
+                    message = data.get("message", {})
+                    usage = message.get("usage", {})
+                    if usage:
+                        yield StreamChunk(
+                            model=config["model"],
+                            input_tokens=usage.get("input_tokens", 0),
+                            cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+                            cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
+                        )
+
+                elif event_type == "content_block_start":
                     block = data.get("content_block", {})
                     if block.get("type") == "tool_use":
                         current_tool = {
@@ -456,6 +576,9 @@ class LLMRouter:
                             "name": block.get("name", ""),
                             "arguments": ""
                         }
+                    elif block.get("type") == "thinking":
+                        # Extended thinking block — track but don't emit to user
+                        pass
 
                 elif event_type == "content_block_delta":
                     delta = data.get("delta", {})
@@ -463,12 +586,19 @@ class LLMRouter:
                         yield StreamChunk(content=delta.get("text"), model=config["model"])
                     elif delta.get("type") == "input_json_delta" and current_tool:
                         current_tool["arguments"] += delta.get("partial_json", "")
+                    elif delta.get("type") == "thinking_delta":
+                        # Extended thinking tokens — don't emit to user
+                        pass
 
                 elif event_type == "content_block_stop":
                     if current_tool:
                         try:
                             args = json.loads(current_tool["arguments"]) if current_tool["arguments"] else {}
-                        except (json.JSONDecodeError, ValueError):
+                        except (json.JSONDecodeError, ValueError) as e:
+                            logger.warning(
+                                f"Malformed JSON in tool arguments for '{current_tool.get('name', '?')}': {e}. "
+                                f"Raw: {current_tool['arguments'][:200]}"
+                            )
                             args = {}
                         yield StreamChunk(
                             tool_call={"id": current_tool["id"], "name": current_tool["name"], "arguments": args},
@@ -511,7 +641,7 @@ class LLMRouter:
                     normalized.append({
                         "role": "tool",
                         "content": str(content_data),
-                        "tool_call_id": "call_" + str(abs(hash(str(content_data))))[:8]
+                        "tool_call_id": "call_" + uuid.uuid4().hex[:8]
                     })
             elif msg["role"] == "assistant" and isinstance(msg.get("content"), list):
                 text_content = ""

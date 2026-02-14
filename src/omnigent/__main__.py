@@ -9,7 +9,6 @@ Usage:
 """
 
 import argparse
-import asyncio
 import sys
 
 from omnigent import __version__

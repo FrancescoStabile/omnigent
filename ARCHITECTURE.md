@@ -113,55 +113,78 @@ Omnigent is built on four principles:
 
 ## The Agent Loop (ReAct)
 
-**File:** `agent.py` (688 lines)
+**File:** `agent.py` (1024 lines)
 
-The core of Omnigent is a ReAct (Reason-Act-Observe) loop with several production hardening layers.
+The core of Omnigent is a ReAct (Reason-Act-Observe) loop with several production hardening layers. The main loop is decomposed into **overridable step methods** — subclass any step to customize behavior without rewriting the loop.
 
 ### Iteration Cycle
 
-Each iteration:
-1. **Check context budget** — trim if messages exceed token threshold
+Each iteration calls these overridable methods:
+1. **`_do_context_management()`** — trim if messages exceed token threshold
 2. **Build dynamic system prompt** — base prompt + DomainProfile + TaskPlan + ReasoningGraph + Knowledge
-3. **Stream LLM response** — via Router with task-based provider selection
-4. **Handle text tokens** — emit to UI, check for finding patterns (`[FINDING: SEVERITY]`)
-5. **Handle tool calls** — loop check → execute → extract → reflect → recover
-6. **Update plan** — mark completed steps, advance phases
-7. **Check termination** — plan complete, done indicators, or consecutive text-only responses
+3. **`_do_llm_call()`** — stream LLM response via Router with task-based provider selection
+4. **Handle text tokens** — emit to UI, parse findings with `re.finditer()` (multi-finding per response)
+5. **Rate limiting** — per-iteration cap (`max_tool_calls_per_iteration`) and total cap (`max_total_tool_calls`)
+6. **Human-in-the-loop** — tools with `requires_approval` flag trigger `approval_callback` before execution
+7. **`_do_tool_execution()`** — execute approved tools in parallel with adaptive timeouts
+8. **`_do_post_tool_processing()`** — extract → async reflect → error recover
+9. **`_check_phase_advancement()`** — advance phases, generate **macro-reflection** via LLM at phase end
+10. **`_check_termination()`** — plan complete, done indicators, or consecutive text-only responses
+11. **Checkpoint** — if `checkpoint_interval > 0`, periodically save state for replay
 
 ### Safety Mechanisms
 
 | Mechanism | How It Works |
 |-----------|-------------|
-| **Loop Detection** | MD5 hash of `{tool_name, args}`. Blocks on first repeated identical call. Recent history: 10 calls. |
+| **Loop Detection** | MD5 hash of `{tool_name, args}`. Blocks on second repeated identical call. Recent history: 10 calls. |
 | **Circuit Breaker** | Tracks repeated LLM errors. After 3 identical errors, stops the loop entirely. |
-| **Adaptive Timeouts** | Per-tool timeout via `TOOL_TIMEOUTS` dict. Default: 300s. |
+| **Rate Limiting** | Two-tier: per-iteration cap (default 20) truncates excessive calls; total cap (default 500) halts execution. |
+| **Human-in-the-Loop** | Tools with `requires_approval` in schema trigger async `approval_callback` before execution. Denied calls return an error message to the LLM. |
+| **Adaptive Timeouts** | Per-tool timeout via `DomainRegistry.tool_timeouts`. Default: 300s. |
 | **Max Iterations** | Hard cap (default: 50). Prevents infinite loops on edge cases. |
 | **Termination Detection** | Pattern matching on text for "task complete", "summary", etc. Also: 3+ consecutive text-only responses = done. |
+| **Checkpoint/Replay** | If `checkpoint_interval > 0`, saves full state (messages, findings, profile, plan) every N iterations for mid-execution recovery. |
 
 ### Event System
 
-The agent yields `AgentEvent` objects for the UI layer:
+The agent yields typed event subclasses of `AgentEvent` for the UI layer. Use `isinstance()` for type-safe handling or match on `event.type`:
 
 ```python
-AgentEvent("text", content="...")           # LLM text token
-AgentEvent("tool_start", tool_name="...")   # Tool execution starting
-AgentEvent("tool_end", tool_result="...")   # Tool execution finished
-AgentEvent("finding", finding=Finding(...)) # New finding registered
-AgentEvent("plan_generated", plan="...")    # Plan created
-AgentEvent("phase_complete", ...)           # Phase advanced
-AgentEvent("reflection", guidance="...")    # Error recovery guidance
-AgentEvent("usage", input_tokens=N, ...)   # Token usage stats
-AgentEvent("error", message="...")          # Error occurred
-AgentEvent("done")                          # Loop finished
+TextEvent(content="...")               # LLM text token
+ToolStartEvent(tool_name, arguments)   # Tool execution starting
+ToolEndEvent(tool_name, tool_result)   # Tool execution finished
+FindingEvent(finding=Finding(...))     # New finding registered
+PlanEvent(plan="...")                  # Plan created
+PhaseCompleteEvent(phase_name, next)   # Phase advanced
+UsageEvent(input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+ErrorEvent(message="...")              # Error occurred
+DoneEvent()                            # Loop finished
+AgentEvent("reflection", guidance=...) # Error recovery guidance
+AgentEvent("paused")                   # Agent paused by user
 ```
+
+All events inherit from `AgentEvent` and support `.type`, `.content`, `.tool_name`, `.finding` properties for backward compatibility.
 
 ---
 
 ## LLM Router
 
-**File:** `router.py` (571 lines)
+**File:** `router.py` (700 lines)
 
-Multi-provider LLM routing with streaming, automatic fallback, and task-based selection.
+Multi-provider LLM routing with streaming, automatic fallback, task-based selection, and **extended thinking** support for Claude.
+
+### Provider Architecture
+
+New providers can be added by subclassing the `LLMProvider` abstract base class:
+
+```python
+class LLMProvider:
+    """Abstract base for LLM providers."""
+    async def stream(self, client, config, messages, tools, system) -> AsyncGenerator[StreamChunk, None]:
+        raise NotImplementedError
+```
+
+Register custom providers via `LLMRouter.register_provider()` — no need to modify the router itself.
 
 ### Supported Providers
 
@@ -201,11 +224,17 @@ All LLM calls use streaming via `httpx`. Each provider has its own streaming par
 
 The router yields `StreamChunk` objects with content, tool calls, and usage stats.
 
+System prompts are always sent as **native system messages** (not injected via `[SYSTEM]:` prefix) — proper `system` parameter for Anthropic, `{"role": "system"}` for OpenAI-compatible APIs.
+
+### Extended Thinking (Claude)
+
+The `stream()` method accepts an optional `thinking_budget` parameter. When set, it enables Claude's extended thinking mode with the specified token budget, useful for complex planning and analysis tasks.
+
 ---
 
 ## Reasoning Graph
 
-**File:** `reasoning_graph.py` (377 lines)
+**File:** `reasoning_graph.py` (389 lines)
 
 **This is the key differentiator.** The reasoning graph transforms the agent from a simple tool-caller into a system that chains findings into multi-step reasoning paths.
 
@@ -217,7 +246,7 @@ Edges = Reasoning Steps          (e.g., "dump_database", "extract_creds")
 Paths = Named Multi-Step Chains  (e.g., "SQLi → DB → Creds → Admin")
 ```
 
-When a finding is confirmed via tools, the graph marks the corresponding node as `CONFIRMED` and activates downstream edges. The agent sees these activated paths in its system prompt and knows what to pursue next.
+When a finding is confirmed via tools, the graph marks the corresponding node as `CONFIRMED` and activates downstream edges. Edges support a `requires_all` field — a list of prerequisite node names that must all be confirmed before the edge activates, enabling complex multi-prerequisite reasoning chains. The agent sees these activated paths in its system prompt and knows what to pursue next.
 
 ### Node States
 
@@ -252,9 +281,9 @@ project_structure  ──complexity_scan──▶  high_complexity
 
 ## Hierarchical Planner
 
-**File:** `planner.py` (402 lines)
+**File:** `planner.py` (544 lines)
 
-The planner decomposes objectives into structured execution plans.
+The planner decomposes objectives into structured execution plans with skip conditions and macro-reflection.
 
 ### Structure
 
@@ -297,11 +326,19 @@ The plan is serialized as markdown and injected into the system prompt:
 
 The LLM sees the active phase, completed steps, and pending work — guiding its next tool selection.
 
+### Skip Conditions
+
+Phases can declare a `skip_condition` (e.g., `"Discovery complete"`). The planner evaluates these against completed phases and skips phases whose conditions are already satisfied.
+
+### Macro-Reflection
+
+When a phase completes, the planner generates a **macro-reflection** via LLM (`generate_phase_reflection()`). This summarizes what was accomplished, key findings, and strategic adjustments. The reflection is stored and injected into the next phase's context, ensuring continuity across phases.
+
 ---
 
 ## Context Management
 
-**File:** `context.py` (229 lines)
+**File:** `context.py` (358 lines)
 
 ### The Problem
 LLM context windows are finite. Long agent sessions can generate hundreds of messages with large tool outputs.
@@ -311,6 +348,10 @@ LLM context windows are finite. Long agent sessions can generate hundreds of mes
 1. **DomainProfile + TaskPlan** — Always in system prompt (never trimmed). This is the agent's persistent memory.
 2. **Middle messages** — Tool results are compressed (heuristic summarization: first 300 chars + truncation notice)
 3. **Recent window** — Last N messages kept intact for LLM coherence
+
+### Semantic Compression (LLM-based)
+
+Beyond heuristic trimming, `semantic_compress_messages()` uses the LLM via the router to intelligently summarize old tool results and conversations while preserving key facts, findings, and decision points. This provides much better context retention than simple truncation.
 
 ### Atomic Groups
 Critical: assistant messages with tool calls and their corresponding tool result messages form **atomic groups**. The trimmer never splits these — breaking them would cause LLM API validation errors.
@@ -339,6 +380,7 @@ Everything the agent knows about its subject. Auto-populated by extractors. Inje
 **Key behaviors:**
 - Duplicate hypothesis detection (same type + location)
 - Confidence upgrading (new evidence can increase confidence)
+- **Bounded `to_prompt_summary()`** — limits confirmed hypotheses (default 15) and untested hypotheses (default 10) with "... and N more" truncation to prevent token bloat
 - Serialization for session persistence
 
 ### State (`state.py`)
@@ -379,7 +421,7 @@ Example: nmap output → `profile.ports`, `profile.technologies`, `profile.hypot
 
 ### 2. Reflection (`reflection.py`)
 
-Generate strategic insight that guides the LLM's next decision.
+Generate strategic insight that guides the LLM's next decision. Supports both **sync and async reflectors** — async reflectors are awaited via `reflect_on_result_async()`, enabling reflectors that make LLM calls or I/O.
 
 ```
 REFLECTORS[tool_name](result, args, profile, lines) → Insight text injected as context
@@ -402,7 +444,7 @@ ERROR_PATTERNS[tool_name]["pattern_name"]["indicators"] → RecoveryStrategy
 
 ## Tool System
 
-**File:** `tools/__init__.py` (222 lines)
+**File:** `tools/__init__.py` (309 lines)
 
 ### ToolRegistry
 
@@ -410,8 +452,10 @@ ERROR_PATTERNS[tool_name]["pattern_name"]["indicators"] → RecoveryStrategy
 registry = ToolRegistry(allowed_targets=["target.com"])
 registry.register("my_tool", handler=my_func, schema={...})
 result = await registry.call("my_tool", {"arg": "value"})
-schemas = registry.get_schemas()  # For LLM tool definitions
+schemas = registry.get_schemas()  # For LLM tool definitions (cached, invalidated on register/unregister)
 ```
+
+Schema output is **cached** after first call to `get_schemas()` and invalidated on `register()` / `unregister()`, avoiding repeated schema construction on every LLM call.
 
 ### Scope Checking
 Tools can be restricted to allowed targets:
@@ -419,11 +463,14 @@ Tools can be restricted to allowed targets:
 - Subdomain matching (`sub.target.com` matches `target.com`)
 - CIDR range matching (`10.0.0.5` matches `10.0.0.0/24`)
 
-### Built-in Tool: `create_finding`
-Always available. Allows the LLM to directly register findings:
+### Built-in Tools
+
+**`create_finding`** — Always available. Allows the LLM to directly register individual findings:
 ```json
 {"name": "create_finding", "arguments": {"title": "...", "severity": "high", ...}}
 ```
+
+**`submit_analysis`** — Structured output tool for formal analysis submission. Accepts step summaries, findings array, conclusions, and recommendations. Provides structured outputs via tool use rather than free-form text.
 
 ### Few-Shot Examples
 Tool schemas include examples from `EXAMPLES` dict for improved LLM accuracy.
@@ -432,7 +479,7 @@ Tool schemas include examples from `EXAMPLES` dict for improved LLM accuracy.
 
 ## Plugin Architecture
 
-**File:** `plugins.py` (487 lines)
+**File:** `plugins.py` (556 lines)
 
 ### Discovery
 Plugins are Python packages in `~/.omnigent/plugins/`:
@@ -451,17 +498,22 @@ Plugins are Python packages in `~/.omnigent/plugins/`:
 - **extractor** — Adds extractors to the pipeline
 - **knowledge** — Adds markdown knowledge files
 
+### Strict Checksum Mode
+
+`PluginManager(strict_checksums=True)` enables SHA-256 checksum verification. Plugins must include a `checksums.json` mapping filenames to expected hashes. In strict mode, plugins without checksums are rejected entirely.
+
 ### Loading Sequence
 1. Scan plugin dir for directories with `__init__.py`
 2. Read metadata from `plugin.json` or `PLUGIN_META` dict
-3. Import module, extract tools/extractors/knowledge
-4. Register into core registries
+3. **Verify checksums** (if strict mode enabled)
+4. Import module, extract tools/extractors/knowledge
+5. Register into core registries
 
 ---
 
 ## Session Persistence
 
-**File:** `session.py` (277 lines)
+**File:** `session.py` (546 lines)
 
 Sessions auto-save to `~/.omnigent/sessions/` as JSON:
 - Full conversation history
@@ -472,25 +524,57 @@ Sessions auto-save to `~/.omnigent/sessions/` as JSON:
 
 Supports: resume, list, delete, export (Markdown, JSON, HTML).
 
+### Checkpoint/Replay
+
+Mid-execution checkpointing enables recovery from crashes or long-running sessions:
+- `save_checkpoint(state, iteration)` — saves full agent state at a specific iteration
+- `restore_checkpoint(session_id)` — restores state to resume from a checkpoint
+- `list_checkpoints()` / `delete_checkpoints()` — checkpoint management
+
+Enable via `Agent(checkpoint_interval=5, session_manager=sm)` to auto-save every 5 iterations.
+
+### Encryption
+
+Session encryption uses `derive_key()` with a **random 16-byte salt** (generated per session) and PBKDF2 key derivation.
+
 ---
 
 ## Extension Model
 
 Omnigent has two extension mechanisms:
 
-### 1. Registry Population (Data-Driven)
-For behavior expressible as data. Import → mutate the dict → done:
+### 1. DomainRegistry (Data-Driven)
 
-| Registry | Module | Key → Value |
-|----------|--------|------------|
-| `PLAN_TEMPLATES` | planner.py | template_key → phase list |
-| `CHAINS` | chains.py | category → ChainStep list |
-| `EXTRACTORS` | extractors.py | tool_name → callable |
-| `REFLECTORS` | reflection.py | tool_name → callable |
-| `ERROR_PATTERNS` | error_recovery.py | tool_name → pattern dict |
-| `KNOWLEDGE_MAP` | knowledge_loader.py | key → file references |
-| `EXAMPLES` | few_shot_examples.py | tool_name → ToolExample list |
-| `TOOL_TIMEOUTS` | agent.py | tool_name → seconds |
+All domain-specific behavior is centralised in a single injectable `DomainRegistry` dataclass (`registry.py`). Pass it to `Agent` — no global state mutations needed:
+
+```python
+from omnigent.registry import DomainRegistry
+
+registry = DomainRegistry(
+    plan_templates={...},
+    chains={...},
+    extractors={...},
+    reflectors={...},
+    error_patterns={...},
+    examples={...},
+    knowledge_map={...},
+    tool_timeouts={...},
+)
+agent = Agent(registry=registry)
+```
+
+| Field | Key → Value |
+|-------|------------|
+| `plan_templates` | template_key → phase list |
+| `chains` | category → ChainStep list |
+| `extractors` | tool_name → callable |
+| `reflectors` | tool_name → callable (sync or async) |
+| `error_patterns` | tool_name → pattern dict |
+| `knowledge_map` | key → file references |
+| `examples` | tool_name → ToolExample list |
+| `tool_timeouts` | tool_name → seconds |
+
+Multiple agents can run with independent registries. For backward compatibility, `DomainRegistry.default()` reads the module-level dicts. Use `registry.merge(other)` to combine registries.
 
 ### 2. Subclass Hooks (Object-Oriented)
 For behavior requiring complex logic:
@@ -501,8 +585,14 @@ For behavior requiring complex logic:
 | `Agent` | `_extract_finding()` | Custom finding patterns |
 | `Agent` | `_build_dynamic_system_prompt()` | Extra context sections |
 | `Agent` | `_on_finding()` | Finding post-processing |
+| `Agent` | `_do_context_management()` | Custom context budget strategy |
+| `Agent` | `_do_llm_call()` | Custom LLM interaction |
+| `Agent` | `_do_tool_execution()` | Custom tool execution (e.g., sequential) |
+| `Agent` | `_do_post_tool_processing()` | Custom post-processing pipeline |
+| `Agent` | `_check_termination()` | Custom termination logic |
 | `ReasoningGraph` | `_build_default_graph()` | Domain reasoning chains |
 | `DomainProfile` | `to_prompt_summary()` | Custom LLM context format |
+| `LLMProvider` | `stream()` | Add new LLM providers |
 
 ---
 
@@ -543,8 +633,8 @@ For behavior requiring complex logic:
 
 ## Design Decisions
 
-### Why empty dicts instead of abstract classes?
-Dicts are simpler to populate from any codebase. No inheritance boilerplate. Just import and assign. This matters because domain implementations may have very different codebases — a security agent, a code analysis tool, and a compliance checker shouldn't need to fit the same class structure.
+### Why a DomainRegistry dataclass?
+Originally the framework used module-level empty dicts. This worked for single-agent scenarios, but leaked state across multiple Agent instances and test cases. The `DomainRegistry` dataclass centralises all registries into a single injectable object, enabling multi-agent scenarios with independent state. The dicts-as-data philosophy remains — fields are still plain dicts, just scoped per agent. `DomainRegistry.default()` preserves backward compatibility with module-level dicts.
 
 ### Why MD5 for loop detection?
 Speed. Loop detection runs on every tool call. MD5 is fast and collision-resistant enough for 10-element deques. We only need "same or different", not cryptographic security.
